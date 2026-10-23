@@ -90,9 +90,14 @@ export function buildDeepSeekHarnessReplayPlan(
 
   for (const event of events) {
     if (event.type.startsWith("compaction/")) {
-      throw new DeepSeekHarnessRecoveryError(
-        `DSH native compaction event ${event.type} violates Spine compaction ownership`,
-      );
+      // Native compaction events that already sit in the log (a pruner sweep
+      // or /compact summary from before Spine owned the session) are history,
+      // not a live ownership race: replay admits source messages only, and
+      // shadow-price/summary events carry no message identity to admit. The
+      // derived context spine republishes supersedes their surface effect.
+      // Observing a compaction/* event on a live Spine session still fails
+      // closed (observeEvent in extension.ts).
+      continue;
     }
     if (!isDeepSeekHarnessMessageEvent(event)) continue;
     if (event.type === "system/message" || event.type === "developer/message") continue;

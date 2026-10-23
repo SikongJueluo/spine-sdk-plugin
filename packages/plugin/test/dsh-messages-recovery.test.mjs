@@ -145,13 +145,28 @@ test("DSH replay skips published copies and derived Spine context messages", () 
   assert.equal(plan.sources[0].observation.message.id, "user-1");
 });
 
-test("DSH replay rejects native compaction ownership violations", () => {
-  assert.throws(
-    () => buildDeepSeekHarnessReplayPlan("s", [
-      { type: "compaction/start", seq: 0, time: 0, data: {} },
-    ]),
-    DeepSeekHarnessRecoveryError,
-  );
+test("DSH replay tolerates historical native compaction events", () => {
+  // A session that ran the native pruner before Spine owned it keeps its
+  // compaction/prune + replacement pairs in the log; recovery must skip the
+  // shadow-price events and dedup the replacement tool result against its
+  // original instead of refusing to resume.
+  const replacement = {
+    ...toolEvent,
+    seq: 3,
+    data: {
+      ...toolEvent.data,
+      message: { ...tool, content: [{ type: "text", text: "pruned" }] },
+    },
+    surfaceOp: { op: "replace", startSeq: 1, endSeq: 1 },
+  };
+  const plan = buildDeepSeekHarnessReplayPlan("s", [
+    userEvent,
+    toolEvent,
+    { type: "compaction/prune", seq: 2, time: 3, data: { shadowedSeqs: [1] } },
+    replacement,
+  ]);
+  const ids = plan.sources.map((source) => source.observation.message.id);
+  assert.deepEqual(ids, ["user-1", "tool-1"]);
 });
 
 test("DSH recovery binds exact replay cells before publication and continues fork namespace", async () => {

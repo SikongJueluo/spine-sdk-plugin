@@ -405,7 +405,9 @@ async function* beginThenStream(
 
 export function observeEvent(state: SessionState, event: SessionEvent): void {
   if (event.type.startsWith("compaction/")) {
-    state.lifecycle.violate(new Error(`DSH native ${event.type} violates Spine compaction ownership`));
+    state.lifecycle.violate(new Error(
+      `DSH native ${event.type} violates Spine compaction ownership; disable the native compaction plugins (compaction-basic, tool-result-pruner) in every preset of this profile — a Host-plane disable alone does not reach preset-mounted rows`,
+    ));
     return;
   }
   switch (event.type) {
