@@ -25,6 +25,7 @@ import {
 import {
   openDeepSeekHarnessLedger,
   type DeepSeekHarnessLedger,
+  type DeepSeekHarnessLedgerEntry,
 } from "./ledger.js";
 import {
   DeepSeekHarnessSamplingLifecycle,
@@ -310,7 +311,7 @@ export async function preparePreStepDecision(
 }
 
 /**
- * Admit the pre-request input and publish the prior plan portion.
+ * Admit the pre-request input and validate the projected plan.
  *
  * The agent loop appends `decision.messages` only after `agent/pre-step` and
  * then freezes the request from the session surface. The input is admitted and
@@ -318,7 +319,9 @@ export async function preparePreStepDecision(
  * events, so a user anchor must never enter them. The anchor reaches the model
  * through the next publication, which replaces the logged input's surface node
  * with the anchored copy; replacement copies are model-only and never touch the
- * transcript.
+ * transcript. Session format v4 admits coordinate-carrying publication events
+ * only inside an open step, so the prior portion (and any divergent replay)
+ * defers and converges at the next in-step publication.
  */
 export async function prepareStepInput(
   state: SessionState,
@@ -356,8 +359,16 @@ function sourceKey(id: EpochOrdinalId): string {
 }
 
 /**
- * Copy the parent's durable journals that are inside a forked prefix into the
- * child ledger. A child then no longer depends on the parent ledger surviving.
+ * Copy the parent's durable spawn-terminal records that sit inside a forked
+ * prefix into the child ledger, so the child no longer depends on the parent
+ * ledger surviving.
+ *
+ * Sampling archives are deliberately NOT inherited: replaying a parent's
+ * sampling identities into the forked namespace makes the runtime reject the
+ * child's first sampling ("sampling identities belong to another thread or
+ * epoch"). The child rebuilds its tree and sampling epochs from its own
+ * replayed host events instead, which is the only inheritance the runtime
+ * supports across a namespace fork.
  */
 export async function inheritForkLedger(
   session: Session,
@@ -369,24 +380,16 @@ export async function inheritForkLedger(
   if (parent === undefined) return;
   const inherited = [...parent.entries]
     .sort((left, right) => left.ordinal - right.ordinal)
-    .filter((entry) => entry.anchorSeq <= session.inheritedEventCount);
+    .filter((entry): entry is Extract<DeepSeekHarnessLedgerEntry, { kind: "spawn-terminal" }> =>
+      entry.kind === "spawn-terminal" && entry.anchorSeq <= session.inheritedEventCount);
   for (const entry of inherited) {
-    if (entry.kind === "archive") {
-      await ledger.appendArchive(
-        session.id,
-        session.header.createdAt,
-        entry.anchorSeq,
-        entry.archive,
-      );
-    } else {
-      await ledger.appendSpawnTerminal(
-        session.id,
-        session.header.createdAt,
-        entry.anchorSeq,
-        entry.batchId,
-        entry.result,
-      );
-    }
+    await ledger.appendSpawnTerminal(
+      session.id,
+      session.header.createdAt,
+      entry.anchorSeq,
+      entry.batchId,
+      entry.result,
+    );
   }
 }
 

@@ -28,6 +28,15 @@ export class DeepSeekHarnessDurabilityError extends Error {
  *    and its durable assistant/tool event payload.
  *
  * Unchanged plans are a no-op, so a normal step never copies history.
+ *
+ * Session format v4 admits coordinate-carrying events (developer/system
+ * messages and assistant/tool copies) only while a step is open, and only at
+ * that step's coordinates: the persistence worker checks positivity at write
+ * time, but the loader replays the full turn/step state machine at read time
+ * and rejects anything else as a corrupt log. DSH invokes publication both
+ * inside steps (sampling finish) and between steps (recovery replay, pre-step
+ * preview), so an out-of-step call defers here and converges at the next
+ * open-step publication; publication is idempotent, so deferral is safe.
  */
 export class DeepSeekHarnessSurfacePublisher {
   readonly #session: Session;
@@ -57,7 +66,8 @@ export class DeepSeekHarnessSurfacePublisher {
       session.snapshotEvents().map((event) => [event.seq, event]),
     );
 
-    const position = currentPosition(events.values());
+    const position = openPosition(events.values());
+    if (position === null) return 0;
     if (messages.length === 0) {
       const visible = nodes.some((node) => {
         const event = events.get(node);
@@ -209,8 +219,8 @@ export class DeepSeekHarnessSurfacePublisher {
       case "developer": {
         const origin = this.#origin(message.id);
         return this.#session.append("developer/message", {
-          turn: origin?.type === "developer/message" ? origin.data.turn : position.turn,
-          step: origin?.type === "developer/message" ? origin.data.step : position.step,
+          turn: position.turn,
+          step: position.step,
           message,
           ...(origin?.type === "developer/message" && origin.data.headerSeq !== undefined
             ? { headerSeq: origin.data.headerSeq }
@@ -218,10 +228,9 @@ export class DeepSeekHarnessSurfacePublisher {
         }, { surfaceOp, sourceEventSeqs });
       }
       case "system": {
-        const origin = this.#origin(message.id);
         return this.#session.append("system/message", {
-          turn: origin?.type === "system/message" ? origin.data.turn : position.turn,
-          step: origin?.type === "system/message" ? origin.data.step : position.step,
+          turn: position.turn,
+          step: position.step,
           message,
         }, { surfaceOp, sourceEventSeqs });
       }
@@ -240,8 +249,8 @@ export class DeepSeekHarnessSurfacePublisher {
       case "developer": {
         const origin = this.#origin(message.id);
         return session.append("developer/message", {
-          turn: origin?.type === "developer/message" ? origin.data.turn : position.turn,
-          step: origin?.type === "developer/message" ? origin.data.step : position.step,
+          turn: position.turn,
+          step: position.step,
           message,
           ...(origin?.type === "developer/message" && origin.data.headerSeq !== undefined
             ? { headerSeq: origin.data.headerSeq }
@@ -249,18 +258,17 @@ export class DeepSeekHarnessSurfacePublisher {
         }, { surfaceOp: "append" });
       }
       case "system": {
-        const origin = this.#origin(message.id);
         return session.append("system/message", {
-          turn: origin?.type === "system/message" ? origin.data.turn : position.turn,
-          step: origin?.type === "system/message" ? origin.data.step : position.step,
+          turn: position.turn,
+          step: position.step,
           message,
         }, { surfaceOp: "append" });
       }
       case "assistant": {
         const origin = this.#requireOrigin(message.id, "assistant/message");
         return session.append("assistant/message", {
-          turn: origin.data.turn,
-          step: origin.data.step,
+          turn: position.turn,
+          step: position.step,
           message,
           stream: origin.data.stream,
           ...(origin.data.usage === undefined ? {} : { usage: origin.data.usage }),
@@ -270,8 +278,8 @@ export class DeepSeekHarnessSurfacePublisher {
       case "tool": {
         const origin = this.#requireOrigin(message.id, "tool/result");
         return session.append("tool/result", {
-          turn: origin.data.turn,
-          step: origin.data.step,
+          turn: position.turn,
+          step: position.step,
           message,
           ...(origin.data.error === undefined ? {} : { error: origin.data.error }),
           ...(origin.data.meta === undefined ? {} : { meta: origin.data.meta }),
@@ -316,24 +324,38 @@ interface TurnStepPosition {
 }
 
 /**
- * DSH session format v4 admits a `developer/message` only at a positive turn
- * and step, and the persistence worker rejects the flush otherwise. Spine
- * publishes between host steps, so synthetic events borrow the session's open
- * turn and its latest started step; a log without turn markers (fresh or
- * seeded before the first turn) falls back to the first position.
+ * The step DSH currently holds open. Session format v4 validates
+ * `developer/message`, `system/message`, `assistant/attempt`, and assistant /
+ * tool events against the open turn and step when loading a log
+ * (dsh-session-format-v3-to-v4 `requireStep`), while the persistence worker
+ * only checks positivity when flushing. Spine publishes both inside steps and
+ * between them, so this derivation returns the open step — or null when no
+ * step is open, meaning no coordinate-carrying event may be written at all.
  */
-function currentPosition(events: Iterable<SessionEvent>): TurnStepPosition {
+function openPosition(events: Iterable<SessionEvent>): TurnStepPosition | null {
   let turn = 0;
   let step = 0;
+  let open = false;
   for (const event of events) {
-    if (event.type === "turn/start") {
-      turn = event.data.turn;
-      step = 0;
-    } else if (event.type === "step/start" && event.data.turn === turn) {
-      step = Math.max(step, event.data.step);
+    switch (event.type) {
+      case "turn/start":
+        turn = event.data.turn;
+        step = 0;
+        open = false;
+        break;
+      case "step/start":
+        if (event.data.turn === turn) {
+          step = event.data.step;
+          open = true;
+        }
+        break;
+      case "step/end":
+      case "turn/end":
+        open = false;
+        break;
     }
   }
-  return { turn: Math.max(turn, 1), step: Math.max(step, 1) };
+  return open && turn >= 1 && step >= 1 ? { turn, step } : null;
 }
 
 /** Stable structural comparison of two persisted messages. */

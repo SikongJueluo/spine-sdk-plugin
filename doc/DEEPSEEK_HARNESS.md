@@ -50,13 +50,16 @@ archive whose cited sources are missing.
 
 At `agent/pre-step` the adapter waits for the waterfall decision, admits the
 **accepted** `decision.messages` before the loop logs them, previews the plan,
-publishes the prior portion (so a compaction decision applies before request
-assembly), and returns the messages unchanged. If `next()` replaces an id or
+and returns the messages unchanged. If `next()` replaces an id or
 its content, the replacement is authoritative; the claimed payload is never
 substituted back. The loop logs that original content, and the human transcript
 renders append-origin events, so the request built from the returned messages
 carries exactly what the user typed; `llm/stream` never rewrites a frozen
-request. Only human inputs (`source.kind: 'user'`) receive a Spine user anchor,
+request. A prior-portion publication may not land at pre-step: session format
+v4 admits coordinate-carrying publication events (developer/system messages,
+assistant/tool copies) only inside an open step, so the publisher defers
+them and they converge at the next in-step (sampling-finish) publication —
+the first request after a divergence serves the logged surface as-is. Only human inputs (`source.kind: 'user'`) receive a Spine user anchor,
 and the anchor is model-only: the next publication replaces the logged input's
 surface node with its anchored copy through the native `surfaceOp: replace`
 protocol, which never touches the transcript (replacement copies stay
@@ -93,12 +96,17 @@ The publisher materializes the Spine `ContextPlan` into real DSH messages, then:
    - user: `user/message`, preserving producer-owned `source`;
    - assistant: `assistant/message` with the original durable `stream`,
      `usage`, and `interrupted` payload;
-   - tool: `tool/result` with the original `turn`/`step`, `error`, and `meta`;
+   - tool: `tool/result` with the original `error` and `meta`;
    - developer/system: only when they came from a host event.
+   Every coordinate-carrying copy carries the currently open turn/step (the
+   loader's `requireStep` rule), never its origin's coordinates.
 6. Awaits `SessionStore.flush()` and fails the session when no listener
    participates.
 
-Unchanged plans return without appending. Derived messages carry
+Unchanged plans return without appending. A publication invoked while no
+step is open (recovery replay, pre-step preview) writes nothing and converges
+at the next in-step publication instead — session format v4 would otherwise
+reject the log at load time as corrupt. Derived messages carry
 `source.kind: "spine-context"`; published copies keep their original message
 identity, so replay can skip every copy after the first occurrence.
 

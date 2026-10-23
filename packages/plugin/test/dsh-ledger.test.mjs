@@ -146,7 +146,7 @@ test("Spine ledger opens on the real DSH storage domain and survives reopen", as
   await second.close();
 });
 
-test("fork inheritance copies only parent journals inside the inherited cut", async () => {
+test("fork inheritance copies only spawn terminals inside the inherited cut", async () => {
   const { Context } = await import("@deepseek-ai/cordis");
   const { SessionStore } = await import("@deepseek-ai/dsh-session");
   const { inheritForkLedger } = await import("../dist/deepseek-harness/extension.js");
@@ -189,13 +189,25 @@ test("fork inheritance copies only parent journals inside the inherited cut", as
     ...STARTED,
     durabilityId: "attempt-2",
   });
+  await ledger.appendSpawnTerminal(parent.id, parent.header.createdAt, 2, "batch-1", {
+    ordinal: 0,
+    outcome: "completed",
+    summary: "done",
+    memory: null,
+  });
   const child = store.fork(parent, 1, "child");
   assert.equal(child.header.parentSession, "parent");
   assert.equal(child.inheritedEventCount, 2);
 
+  // Sampling archives must NOT be inherited: replaying a parent's sampling
+  // identities into the forked namespace makes the runtime reject the child's
+  // first sampling. The child rebuilds its tree from replayed host events.
   await inheritForkLedger(child, ledger);
   const inherited = await ledger.entries(child.id, child.header.createdAt);
-  assert.deepEqual(inherited.map((entry) => entry.archive.durabilityId), ["attempt-1"]);
+  assert.deepEqual(
+    inherited.map((entry) => (entry.kind === "spawn-terminal" ? entry.batchId : entry.kind)),
+    ["batch-1"],
+  );
   await inheritForkLedger(child, ledger);
   assert.equal((await ledger.entries(child.id, child.header.createdAt)).length, 1);
 });

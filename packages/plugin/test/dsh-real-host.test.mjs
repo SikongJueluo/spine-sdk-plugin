@@ -83,23 +83,90 @@ function originsOf(events) {
   return origins;
 }
 
-/** Mirror the host format-v4 admission rule the persistence worker enforces. */
-function assertPositiveCoordinates(session) {
+/**
+ * Mirror the loader's v4 admission state machine (dsh-session-format-v3-to-v4
+ * `requireStep`, STEP_EVENT_TYPES, and tool pairing). The persistence worker
+ * only checks positive coordinates at write time; the loader replays these
+ * rules when loading, so a publication that breaks them corrupts the log.
+ */
+function assertV4Admission(session) {
+  const stepEventTypes = new Set(["system/message", "developer/message", "assistant/attempt"]);
+  let turn = null;
+  let step = null;
+  let nextTurn = 1;
+  let nextStep = 1;
+  const tools = new Map();
   for (const event of session.snapshotEvents()) {
-    if (event.type !== "developer/message") continue;
-    assert.ok(
-      Number.isSafeInteger(event.data.turn) && event.data.turn >= 1,
-      `developer/message at seq ${event.seq} must carry a positive turn, got ${String(event.data.turn)}`,
-    );
-    assert.ok(
-      Number.isSafeInteger(event.data.step) && event.data.step >= 1,
-      `developer/message at seq ${event.seq} must carry a positive step, got ${String(event.data.step)}`,
-    );
+    const data = event.data ?? {};
+    const requireStep = (type) => {
+      assert.ok(
+        turn !== null && step !== null && data.turn === turn && data.step === step,
+        `${type} at seq ${event.seq} must match the open turn and step ` +
+          `(${String(turn)}/${String(step)}), got ${String(data.turn)}/${String(data.step)}`,
+      );
+    };
+    if (stepEventTypes.has(event.type)) requireStep(event.type);
+    switch (event.type) {
+      case "turn/start":
+        assert.ok(turn === null && data.turn === nextTurn,
+          `turn/start at seq ${event.seq} must open turn ${nextTurn}`);
+        turn = nextTurn;
+        nextStep = 1;
+        tools.clear();
+        break;
+      case "turn/end":
+        assert.ok(turn === data.turn && step === null,
+          `turn/end at seq ${event.seq} must match the open turn with no open step`);
+        turn = null;
+        nextTurn += 1;
+        break;
+      case "step/start":
+        assert.ok(turn === data.turn && step === null && data.step === nextStep,
+          `step/start at seq ${event.seq} must match the open turn and next step`);
+        step = nextStep;
+        break;
+      case "step/end":
+        requireStep(event.type);
+        step = null;
+        nextStep += 1;
+        break;
+      case "assistant/message":
+        requireStep(event.type);
+        for (const block of data.message.content ?? []) {
+          if (block.type !== "tool-call") continue;
+          assert.ok(!tools.has(block.id),
+            `assistant/message at seq ${event.seq} repeats advertised tool call ${block.id}`);
+          tools.set(block.id, { started: false });
+        }
+        break;
+      case "tool/call":
+        requireStep(event.type);
+        assert.ok(tools.has(data.callId),
+          `tool/call ${data.callId} at seq ${event.seq} has no advertised tool lifecycle`);
+        tools.get(data.callId).started = true;
+        break;
+      case "tool/result":
+        if (event.surfaceOp === "append") {
+          requireStep(event.type);
+          assert.ok(tools.has(data.message.toolCallId),
+            `tool/result ${data.message.toolCallId} at seq ${event.seq} has no advertised tool call`);
+          tools.delete(data.message.toolCallId);
+        } else {
+          assert.ok(turn !== null, `tool/result at seq ${event.seq} is outside an open turn`);
+        }
+        break;
+      default:
+        break;
+    }
   }
 }
 
 test("surface publisher compacts with native replace events and is idempotent", async () => {
   const { store, session } = liveSession("publish");
+  // A publication may only land while a step is open (loader `requireStep`),
+  // so the synthetic session keeps turn 1 / step 1 open for every publish.
+  session.append("turn/start", { turn: 1 });
+  session.append("step/start", { turn: 1, step: 1 });
   system(store, session);
   session.append("user/message", user("u1", "hello"), { surfaceOp: "append" });
 
@@ -154,6 +221,7 @@ test("surface publisher compacts with native replace events and is idempotent", 
   const seqAfterFirst = session.seq;
   assert.equal(await publisher.publish(target), 0);
   assert.equal(session.seq, seqAfterFirst);
+  assertV4Admission(session);
 
   // A cold restore folds the same published surface from the log.
   const restored = liveSession("publish");
@@ -169,6 +237,8 @@ test("surface publisher compacts with native replace events and is idempotent", 
 
 test("surface publisher re-appends real assistant and tool identities after compaction", async () => {
   const { store, session } = liveSession("copies");
+  session.append("turn/start", { turn: 1 });
+  session.append("step/start", { turn: 1, step: 1 });
   system(store, session);
   session.append("user/message", user("u1", "hello"), { surfaceOp: "append" });
   session.append("assistant/message", {
@@ -197,6 +267,7 @@ test("surface publisher re-appends real assistant and tool identities after comp
     toolResult("t1", "call-1", "ok"),
   ];
   await publisher.publish(target);
+  assertV4Admission(session);
   assert.deepEqual(
     session.deriveMessages().map((message) => [message.role, message.id]),
     [["system", "system-1"], ["user", "u1"], ["user", "summary"], ["assistant", "a1"], ["tool", "t1"]],
@@ -214,16 +285,27 @@ test("surface publisher re-appends real assistant and tool identities after comp
 
 test("Spine recovery publishes a real WASM ContextPlan and restores without republishing", async () => {
   const { store, session, flushCount } = liveSession("e2e");
+  session.append("turn/start", { turn: 1 });
+  session.append("step/start", { turn: 1, step: 1 });
   system(store, session);
   const first = session.append("user/message", user("u1", "explain the build"), { surfaceOp: "append" });
+  session.append("step/end", { turn: 1, step: 1 });
+  session.append("turn/end", { turn: 1, reason: { kind: "completed" } });
   const ledger = new MemoryDeepSeekHarnessLedger();
 
+  // Recovery runs between turns: no step is open, so its replay publication
+  // defers and must not touch the log.
+  const seqAtRecovery = session.seq;
   const recovered = await recoverWith(session, store, ledger, null);
+  assert.equal(session.seq, seqAtRecovery, "out-of-step recovery must defer its publication");
+  session.append("turn/start", { turn: 2 });
+  session.append("step/start", { turn: 2, step: 1 });
   await recovered.adapter.beginSampling();
   await recovered.adapter.finishSampling("completed");
 
   const published = session.deriveMessages();
   validateStoredEvents(session.header, structuredClone(session.snapshotEvents()));
+  assertV4Admission(session);
   assert.equal(published[0].role, "system");
   assert.ok(published.some((message) => message.role === "user" && message.id === "u1"));
   assert.ok(flushCount() > 0);
@@ -259,6 +341,11 @@ test("concrete port fails closed when the host has no durability listener", asyn
   const ctx = new Context();
   const store = new SessionStore(ctx);
   const session = store.create("no-durability");
+  // The publication window must be open (v4 admits coordinate-carrying events
+  // only inside an open step) so the flush — and its missing listener — is
+  // actually reached.
+  session.append("turn/start", { turn: 1 });
+  session.append("step/start", { turn: 1, step: 1 });
   const ledger = new MemoryDeepSeekHarnessLedger();
   const bindings = new DeepSeekHarnessSourceBindings();
   const port = createDeepSeekHarnessSessionPort({ session, sessions: store, ledger, bindings });
@@ -309,6 +396,8 @@ async function recoverWith(session, store, ledger, replayPlan) {
 
 test("surface publisher rejects an unpaired tool result", async () => {
   const { store, session } = liveSession("unpaired");
+  session.append("turn/start", { turn: 1 });
+  session.append("step/start", { turn: 1, step: 1 });
   system(store, session);
   const publisher = new DeepSeekHarnessSurfacePublisher(session, store, () => null);
   await assert.rejects(
@@ -419,6 +508,13 @@ test("an empty plan over live history fails closed instead of erasing it", async
   system(store, session);
   session.append("user/message", user("u1", "keep me"), { surfaceOp: "append" });
   const publisher = new DeepSeekHarnessSurfacePublisher(session, store, () => null);
+  // No step is open: the erasing plan defers instead of publishing anything.
+  const seqBefore = session.seq;
+  assert.equal(await publisher.publish([]), 0);
+  assert.equal(session.seq, seqBefore);
+  // Inside an open step the guard still fails closed.
+  session.append("turn/start", { turn: 1 });
+  session.append("step/start", { turn: 1, step: 1 });
   await assert.rejects(
     publisher.publish([]),
     /refusing to erase/,
@@ -428,6 +524,8 @@ test("an empty plan over live history fails closed instead of erasing it", async
 
 test("consecutive differing plans never drop a planned message behind a carrier", async () => {
   const { store, session } = liveSession("carrier-suffix");
+  session.append("turn/start", { turn: 1 });
+  session.append("step/start", { turn: 1, step: 1 });
   system(store, session);
   for (const id of ["A", "Z", "B"]) {
     session.append("user/message", user(id, id), { surfaceOp: "append" });
@@ -439,7 +537,7 @@ test("consecutive differing plans never drop a planned message behind a carrier"
     (id) => origins.get(id) ?? null,
   );
   assert.ok(await publisher.publish([user("A", "A"), user("B", "B")]) > 0);
-  assertPositiveCoordinates(session);
+  assertV4Admission(session);
   assert.deepEqual(
     session.deriveMessages().map((message) => message.id),
     ["system-1", "A", "B"],
@@ -448,7 +546,7 @@ test("consecutive differing plans never drop a planned message behind a carrier"
     user("X", "X", { kind: "spine-context", form: "recall" }),
     user("B", "B"),
   ]) > 0);
-  assertPositiveCoordinates(session);
+  assertV4Admission(session);
   assert.deepEqual(
     session.deriveMessages().map((message) => message.id),
     ["system-1", "X", "B"],
@@ -456,7 +554,7 @@ test("consecutive differing plans never drop a planned message behind a carrier"
   );
 });
 
-test("synthetic developer events borrow the session's open turn and latest step", async () => {
+test("synthetic events defer without an open step and borrow the open step once started", async () => {
   const { store, session } = liveSession("carrier-position");
   session.append("turn/start", { turn: 1 });
   session.append("step/start", { turn: 1, step: 1 });
@@ -468,6 +566,7 @@ test("synthetic developer events borrow the session's open turn and latest step"
     message: assistant("a1", "hi"),
     stream: [],
   }, { surfaceOp: "append" });
+  session.append("step/end", { turn: 1, step: 1 });
   session.append("turn/end", { turn: 1, reason: { kind: "completed" } });
   session.append("turn/start", { turn: 2 });
 
@@ -477,15 +576,21 @@ test("synthetic developer events borrow the session's open turn and latest step"
     store,
     (id) => origins.get(id) ?? null,
   );
-  // Pure deletion of the assistant node: one empty developer carrier replaces
-  // it, admitted at the open turn with that turn's latest started step.
+  // Turn 2 is open but no step is: no coordinate is legal, so the pure
+  // deletion of the assistant node defers instead of corrupting the log.
+  const seqBeforeDeletion = session.seq;
+  assert.equal(await publisher.publish([user("u1", "hello")]), 0);
+  assert.equal(session.seq, seqBeforeDeletion);
+
+  // Once the host opens step (2, 1), the carrier is admitted exactly there.
+  session.append("step/start", { turn: 2, step: 1 });
   assert.equal(await publisher.publish([user("u1", "hello")]), 1);
-  assertPositiveCoordinates(session);
+  assertV4Admission(session);
   const carrier = session.snapshotEvents().at(-1);
   assert.equal(carrier.type, "developer/message");
   assert.deepEqual([carrier.data.turn, carrier.data.step], [2, 1]);
 
-  // A log without turn markers still admits carriers at the first position.
+  // A log without turn markers defers the same way...
   const fresh = liveSession("carrier-fresh");
   for (const id of ["u1", "X", "B"]) {
     fresh.session.append("user/message", user(id, id), { surfaceOp: "append" });
@@ -495,11 +600,83 @@ test("synthetic developer events borrow the session's open turn and latest step"
     fresh.store,
     (id) => originsOf(fresh.session.snapshotEvents()).get(id) ?? null,
   );
+  const freshBefore = fresh.session.seq;
+  assert.equal(await freshPublisher.publish([user("u1", "u1"), user("B", "B")]), 0);
+  assert.equal(fresh.session.seq, freshBefore);
+  // ...and publishes at the first position once a step opens.
+  fresh.session.append("turn/start", { turn: 1 });
+  fresh.session.append("step/start", { turn: 1, step: 1 });
   assert.equal(await freshPublisher.publish([user("u1", "u1"), user("B", "B")]), 1);
-  assertPositiveCoordinates(fresh.session);
+  assertV4Admission(fresh.session);
   const freshEvent = fresh.session.snapshotEvents().at(-1);
   assert.equal(freshEvent.type, "developer/message");
   assert.deepEqual([freshEvent.data.turn, freshEvent.data.step], [1, 1]);
+});
+
+test("a deferred resume replay converges at the open step without stale coordinates", async () => {
+  // Regression: after resuming a session, the recovery replay once published a
+  // replacement carrier and history copies while no step was open (or with the
+  // origin's stale turn/step), which the v4 loader rejects as a corrupt log
+  // ("developer/message does not match an open turn and step").
+  const { store, session } = liveSession("resume-corruption");
+  session.append("turn/start", { turn: 1 });
+  session.append("step/start", { turn: 1, step: 1 });
+  system(store, session);
+  session.append("user/message", user("u1", "hello"), { surfaceOp: "append" });
+  session.append("assistant/message", {
+    turn: 1,
+    step: 1,
+    message: assistant("a1", "hi"),
+    stream: [],
+  }, { surfaceOp: "append" });
+  session.append("step/end", { turn: 1, step: 1 });
+  session.append("turn/end", { turn: 1, reason: { kind: "completed" } });
+  const origins = originsOf(session.snapshotEvents());
+  const publisher = new DeepSeekHarnessSurfacePublisher(
+    session,
+    store,
+    (id) => origins.get(id) ?? null,
+  );
+
+  // The resumed turn opens with no step: the divergent plan (anchored input
+  // plus replayed assistant copy) must defer untouched.
+  session.append("turn/start", { turn: 2 });
+  const plan = [
+    user("u2", "spine context", { kind: "spine-context", form: "recall" }),
+    assistant("a1", "hi"),
+    user("u3", "tail", { kind: "spine-context", form: "recall" }),
+  ];
+  const seqBeforeReplay = session.seq;
+  assert.equal(await publisher.publish(plan), 0, "the replay publication must defer");
+  assert.equal(session.seq, seqBeforeReplay);
+
+  // At the open step the whole plan lands, every coordinate-carrying copy at
+  // the open (turn, step) — never at its origin's stale coordinates.
+  session.append("step/start", { turn: 2, step: 1 });
+  assert.ok((await publisher.publish(plan)) > 0);
+  assertV4Admission(session);
+  validateStoredEvents(session.header, structuredClone(session.snapshotEvents()));
+  for (const event of session.snapshotEvents()) {
+    if (event.seq <= seqBeforeReplay) continue;
+    if (["developer/message", "system/message", "assistant/message", "tool/result"].includes(event.type)) {
+      assert.deepEqual(
+        [event.data.turn, event.data.step],
+        [2, 1],
+        `${event.type} at seq ${event.seq} must carry the open step`,
+      );
+    }
+  }
+
+  // The reloaded surface folds to the plan exactly and stays transcript-real.
+  const copy = liveSession("resume-corruption");
+  const restored = copy.store.create("resume-copy", {
+    seed: session.snapshotEvents(),
+    meta: { createdAt: session.header.createdAt },
+  });
+  assert.deepEqual(
+    restored.deriveMessages().map((message) => [message.role, message.id]),
+    [["system", "system-1"], ["user", "u2"], ["assistant", "a1"], ["user", "u3"]],
+  );
 });
 
 test("pre-step logs the input unchanged and anchors it model-only at the next publication", async () => {
@@ -518,6 +695,8 @@ test("pre-step logs the input unchanged and anchors it model-only at the next pu
 
   // The loop appends the system prompt and then the decision messages. The
   // first request therefore sees the input exactly as the user typed it.
+  session.append("turn/start", { turn: 1 });
+  session.append("step/start", { turn: 1, step: 1 });
   system(store, session);
   const event = session.append("user/message", logged, { surfaceOp: "append" });
   observeEvent(state, event);
@@ -542,7 +721,7 @@ test("pre-step logs the input unchanged and anchors it model-only at the next pu
   const nextInput = nextDecision.messages[0];
   assert.ok(nextInput);
   assert.equal(nextInput.content[0].text, "second input");
-  assertPositiveCoordinates(session);
+  assertV4Admission(session);
   const anchoredCopy = session.deriveMessages()
     .find((message) => message.content[0].text.includes("first input"));
   assert.equal(anchoredCopy.content[0].text, "[U1]\nfirst input");
@@ -563,8 +742,11 @@ test("pre-step logs the input unchanged and anchors it model-only at the next pu
     .filter((message) => message.role !== "system")
     .map((message) => message.content[0].text);
   assert.deepEqual(derivedTexts, ["[U1]\nfirst input", "second input"]);
+  session.append("step/end", { turn: 1, step: 1 });
+  session.append("step/start", { turn: 1, step: 2 });
   await state.lifecycle.beginSampling();
   await state.lifecycle.finishNow("completed");
+  assertV4Admission(session);
   assert.equal(
     session.deriveMessages().filter((message) => message.content[0].text.includes("first input")).length,
     1,
@@ -585,8 +767,11 @@ test("pre-step logs the input unchanged and anchors it model-only at the next pu
   );
   const thirdEvent = session.append("user/message", thirdDecision.messages[0], { surfaceOp: "append" });
   observeEvent(state, thirdEvent);
+  session.append("step/end", { turn: 1, step: 2 });
+  session.append("step/start", { turn: 1, step: 3 });
   await state.lifecycle.beginSampling();
   await state.lifecycle.finishNow("completed");
+  assertV4Admission(session);
 
   // Cold replay must observe the original inputs, converge to the same
   // anchored model view, and must not republish or double-anchor.
@@ -938,6 +1123,8 @@ test("plan copies are not host acceptance evidence and cannot publish unaccepted
   }), false);
 
   const { store, session } = liveSession("unaccepted");
+  session.append("turn/start", { turn: 1 });
+  session.append("step/start", { turn: 1, step: 1 });
   system(store, session);
   const publisher = new DeepSeekHarnessSurfacePublisher(session, store, () => null);
   await assert.rejects(
