@@ -13,6 +13,7 @@ import {
   decodeSpineSpawnTasks,
   isSpineToolName,
   operationFromSpineToolCall,
+  SpineToolInputError,
 } from "../tools.js";
 import type { DeepSeekHarnessMessage, DeepSeekHarnessMessageEvent } from "./dsh.js";
 import {
@@ -167,19 +168,27 @@ export class DeepSeekHarnessSamplingLifecycle {
       if (this.#executions.has(start.callId)) {
         throw new DeepSeekHarnessLifecycleError(`duplicate DSH Spine tool call ${start.callId}`);
       }
-      const input = decodeToolInput(start.arguments);
-      const operation = toolName === "spine_spawn"
-        ? null
-        : operationFromSpineToolCall(toolName, input);
-      if (toolName === "spine_spawn") decodeSpineSpawnTasks(input);
-      await this.#adapter.registerExecution(start.callId);
-      this.#executions.add(start.callId);
-      if (operation !== null) {
-        await this.#adapter.stageExecution(
-          start.callId,
-          start.callId,
-          operation,
-        );
+      // Model-authored arguments are rejected, not faulted: the tool's own
+      // execute() surfaces the identical validation failure to the model as
+      // an erroneous tool result it may retry inside the same sampling. The
+      // call stays unregistered, so tool finish is a no-op.
+      try {
+        const input = decodeToolInput(start.arguments);
+        const operation = toolName === "spine_spawn"
+          ? null
+          : operationFromSpineToolCall(toolName, input);
+        if (toolName === "spine_spawn") decodeSpineSpawnTasks(input);
+        await this.#adapter.registerExecution(start.callId);
+        this.#executions.add(start.callId);
+        if (operation !== null) {
+          await this.#adapter.stageExecution(
+            start.callId,
+            start.callId,
+            operation,
+          );
+        }
+      } catch (cause) {
+        if (!(cause instanceof SpineToolInputError)) throw cause;
       }
     });
     return true;
@@ -341,12 +350,12 @@ function decodeToolInput(input: unknown): Record<string, unknown> {
   if (typeof input === "string") {
     try {
       value = JSON.parse(input) as unknown;
-    } catch (cause) {
-      throw new DeepSeekHarnessLifecycleError("DSH Spine tool arguments are not JSON", { cause });
+    } catch {
+      throw new SpineToolInputError("DSH Spine tool arguments are not JSON");
     }
   }
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    throw new DeepSeekHarnessLifecycleError("DSH Spine tool arguments are not an object");
+    throw new SpineToolInputError("DSH Spine tool arguments are not an object");
   }
   return value as Record<string, unknown>;
 }

@@ -9,6 +9,7 @@ import { executeSpawnBatch, type SpawnChildTerminal } from "../spawn.js";
 import {
   decodeSpineSpawnTasks,
   operationFromSpineToolCall,
+  SpineToolInputError,
   SPINE_TOOL_NAMES,
   type SpineToolName,
 } from "../tools.js";
@@ -455,7 +456,7 @@ export function observeEvent(state: SessionState, event: SessionEvent): void {
   }
 }
 
-function createTool(
+export function createTool(
   ctx: Context,
   toolName: SpineToolName,
   spawnProvider: string,
@@ -505,7 +506,7 @@ function createTool(
         );
         return { status: "accepted" };
       }
-      const tasks = decodeSpineSpawnTasks(args as Record<string, unknown>);
+      const tasks = decodeSpawnTasksOrExplain(args);
       const state = await ensureState(agent);
       const results = await executeSpawnBatch({
         batchId: exec.callId,
@@ -573,7 +574,21 @@ function toolDescription(name: SpineToolName): string {
     case "spine_open": return "Open one child Spine scope with a concise summary.";
     case "spine_close": return "Close the active Spine scope with model-authored memory.";
     case "spine_next": return "Close the active Spine scope and open its next sibling.";
-    case "spine_spawn": return "Run independent child tasks and return ordered terminal memories.";
+    case "spine_spawn": return "Fan out AT LEAST TWO independent child tasks (tasks.length must be >= 2; single-subtask work is not a fan-out) and return ordered terminal memories.";
+  }
+}
+
+/** Same core validation as the lifecycle path, but the model sees a message it can act on. */
+function decodeSpawnTasksOrExplain(args: unknown): SpawnTask[] {
+  try {
+    return decodeSpineSpawnTasks(args as Record<string, unknown>);
+  } catch (cause) {
+    if (cause instanceof SpineToolInputError) {
+      throw new SpineToolInputError(
+        `${cause.message}. spine_spawn fans out independent work: pass at least two tasks; handle single-subtask work inline instead.`,
+      );
+    }
+    throw cause;
   }
 }
 

@@ -8,6 +8,7 @@ import { createNodeSpineRuntime } from "@spinejit/spine-sdk/node";
 
 import {
   apply,
+  createTool,
   isHostAcceptanceEvent,
   observeEvent,
   preparePreStepDecision,
@@ -701,6 +702,74 @@ test("real tool success and failure commit the matching Spine execution", async 
     state.lifecycle.dispose();
     state.runtime.dispose();
   }
+});
+
+test("invalid spine_spawn arguments are rejected without faulting the session", async () => {
+  const { ctx, store, session } = liveSession("spawn-undercount");
+  system(store, session);
+  session.append("user/message", user("u1", "spawn one task"), { surfaceOp: "append" });
+  const spawnArgs = JSON.stringify({ tasks: [{ summary: "only", prompt: "do it" }] });
+  session.append("assistant/message", {
+    turn: 1,
+    step: 1,
+    message: {
+      ...assistant("a1", "fan out", "call-1"),
+      content: [
+        { type: "text", text: "fan out" },
+        { type: "tool-call", id: "call-1", name: "spine_spawn", arguments: spawnArgs },
+      ],
+    },
+    stream: [],
+  }, { surfaceOp: "append" });
+  const ledger = new MemoryDeepSeekHarnessLedger();
+  const state = await recoverState(ctx, session, undefined, async () => ledger);
+  await state.lifecycle.beginSampling();
+  observeEvent(state, {
+    type: "tool/call",
+    seq: 100,
+    time: 1,
+    data: { turn: 1, step: 1, callId: "call-1", name: "spine_spawn", arguments: spawnArgs },
+  });
+  // The model sees the rejection as an erroneous tool result and retries;
+  // the host reports isError, which reaches tool finish as a no-op.
+  observeEvent(state, {
+    type: "tool/result",
+    seq: 101,
+    time: 2,
+    data: {
+      turn: 1,
+      step: 1,
+      message: {
+        ...toolResult("t1", "call-1", "invalid spine.spawn arguments"),
+        isError: true,
+      },
+    },
+  });
+  // Previously the rejected admission stuck as a lifecycle fault and this
+  // finish surfaced "DSH Spine lifecycle fault: invalid spine.spawn arguments".
+  await state.lifecycle.finishNow("completed");
+  const commit = (await ledger.entries(session.id, session.header.createdAt))
+    .filter((entry) => entry.kind === "archive")
+    .at(-1).archive.record.record;
+  assert.equal(commit.executions.length, 0);
+  // The lifecycle stays healthy for the next sampling after the model retries.
+  await state.lifecycle.beginSampling();
+  state.lifecycle.dispose();
+  state.runtime.dispose();
+});
+
+test("the spine_spawn tool contract and guided rejection", async () => {
+  const ctx = new Context();
+  const tool = createTool(ctx, "spine_spawn", "spawn", async () => {
+    throw new Error("ensureState must not run for rejected arguments");
+  });
+  assert.match(String(tool.description), /AT LEAST TWO/);
+  await assert.rejects(
+    tool.execute({ tasks: [{ summary: "only", prompt: "do it" }] }, { agent: {}, callId: "c1" }),
+    (error) =>
+      /at least two tasks/.test(error.message)
+      && /pass at least two tasks/.test(error.message),
+  );
 });
 
 test("a pre-admitted input that never reaches the log faults the session", async () => {
