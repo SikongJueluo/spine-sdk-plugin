@@ -51,17 +51,24 @@ archive whose cited sources are missing.
 At `agent/pre-step` the adapter waits for the waterfall decision, admits the
 **accepted** `decision.messages` before the loop logs them, previews the plan,
 publishes the prior portion (so a compaction decision applies before request
-assembly), and returns those messages with the Spine-materialized content. If
-`next()` replaces an id or its content, the replacement is authoritative; the
-claimed payload is never substituted back. Only human inputs (`source.kind:
-'user'`) receive a Spine user anchor. Other legal user-role producers (`goal`,
-`agent-message`, auto-continue, runtime context) remain contextual sources and
-keep their producer-owned source through replay. The request is built from those
-returned messages; `llm/stream` never rewrites a frozen request. The anchored
-input stores its pre-anchor content in the message source (`spineInput`), so
-replay observes the same source content and does not double-anchor. The field
-lives only in `Message.source`; the DeepSeek wire formatter serializes
-role/content, and other provider adapters must keep source non-model-facing. If the loop
+assembly), and returns the messages unchanged. If `next()` replaces an id or
+its content, the replacement is authoritative; the claimed payload is never
+substituted back. The loop logs that original content, and the human transcript
+renders append-origin events, so the request built from the returned messages
+carries exactly what the user typed; `llm/stream` never rewrites a frozen
+request. Only human inputs (`source.kind: 'user'`) receive a Spine user anchor,
+and the anchor is model-only: the next publication replaces the logged input's
+surface node with its anchored copy through the native `surfaceOp: replace`
+protocol, which never touches the transcript (replacement copies stay
+model-only). The first request after an input therefore carries no anchor;
+every later request does. Other legal user-role producers (`goal`,
+`agent-message`, auto-continue, runtime context) remain contextual sources,
+keep their producer-owned source through replay, and never receive an anchor.
+The anchored copy stores its pre-anchor content in the message source
+(`spineInput`), so replay observes the same source content and does not
+double-anchor. The field lives only in `Message.source`; the DeepSeek wire
+formatter serializes role/content, and other provider adapters must keep source
+non-model-facing. If the loop
 never logs a pre-admitted input, the lifecycle faults instead of continuing
 with state the log cannot reconstruct. A failure during pre-admission discards
 that session's runtime/state; the next pre-step rebuilds it from the host log

@@ -13,7 +13,6 @@ import {
   type SpineToolName,
 } from "../tools.js";
 import {
-  withInputProvenance,
   type DeepSeekHarnessMessage,
 } from "./dsh.js";
 import {
@@ -30,7 +29,6 @@ import {
   DeepSeekHarnessSamplingLifecycle,
 } from "./lifecycle.js";
 import {
-  materializeDeepSeekHarnessContext,
   type DeepSeekHarnessSourceBindings,
 } from "./messages.js";
 import {
@@ -299,13 +297,10 @@ export async function preparePreStepDecision(
     const decision = await next();
     if (decision.kind !== "enter" || decision.messages.length === 0) return decision;
     // The host may replace ids or content. Only the ACCEPTED decision is
-    // admitted and materialized; the claimed payload is not authoritative.
-    const replacements = await prepareStepInput(state, decision.messages);
-    return {
-      ...decision,
-      messages: decision.messages.map((message) =>
-        replacements.get(message.id) ?? message),
-    };
+    // admitted; the claimed payload is never substituted back. The input is
+    // logged unchanged, so the human transcript keeps what the user typed.
+    await prepareStepInput(state, decision.messages);
+    return decision;
   } catch (error) {
     // A failed pre-admission candidate must not survive as a phantom source.
     await onInvalid?.();
@@ -314,18 +309,20 @@ export async function preparePreStepDecision(
 }
 
 /**
- * Publish the pre-request portion of the plan and return the current inputs with
- * the Spine materialized content (for example a user anchor).
+ * Admit the pre-request input and publish the prior plan portion.
  *
- * The agent loop appends `decision.messages` only after `agent/pre-step` and then
- * freezes the request. Admitting the claimed input early lets this adapter apply
- * compaction and anchors before `buildRequest`, without rewriting the frozen
- * request at `llm/stream`.
+ * The agent loop appends `decision.messages` only after `agent/pre-step` and
+ * then freezes the request from the session surface. The input is admitted and
+ * logged with its original content — the human transcript renders append-origin
+ * events, so a user anchor must never enter them. The anchor reaches the model
+ * through the next publication, which replaces the logged input's surface node
+ * with the anchored copy; replacement copies are model-only and never touch the
+ * transcript.
  */
 export async function prepareStepInput(
   state: SessionState,
   messages: readonly DeepSeekHarnessMessage[],
-): Promise<Map<string, Extract<DeepSeekHarnessMessage, { role: "user" }>>> {
+): Promise<void> {
   const admitted = await state.lifecycle.admitInput(messages);
   const preview = await state.lifecycle.preview();
   const plan = preview.contextPlan;
@@ -333,7 +330,7 @@ export async function prepareStepInput(
     throw new Error("Spine preview returned no ContextPlan before request assembly");
   }
   const created = admitted.filter(({ created: isNew }) => isNew);
-  if (created.length === 0) return new Map();
+  if (created.length === 0) return;
   const newKeys = new Set(created.map(({ sourceId }) => sourceKey(sourceId)));
   const firstInput = plan.cells.findIndex((cell) =>
     cell.type === "source" && newKeys.has(sourceKey(cell.source_id)));
@@ -351,38 +348,6 @@ export async function prepareStepInput(
     ...preview,
     contextPlan: { ...plan, cells: plan.cells.slice(0, firstInput) },
   });
-
-  const materialized = materializeDeepSeekHarnessContext(preview, state.bindings);
-  const bySource = new Map<string, DeepSeekHarnessMessage>();
-  plan.cells.forEach((cell, index) => {
-    if (cell.type === "source" && newKeys.has(sourceKey(cell.source_id))) {
-      const message = materialized[index];
-      if (message !== undefined) bySource.set(sourceKey(cell.source_id), message);
-    }
-  });
-
-  const byId = new Map(messages.map((message) => [String(message.id), message]));
-  const replacements = new Map<string, Extract<DeepSeekHarnessMessage, { role: "user" }>>();
-  for (const { messageId, sourceId } of admitted) {
-    const target = bySource.get(sourceKey(sourceId));
-    const original = byId.get(messageId);
-    if (target === undefined || original === undefined || target.role !== "user") {
-      throw new Error(`Spine ContextPlan has no materialized user input for ${messageId}`);
-    }
-    if (String(target.id) !== messageId) {
-      throw new Error(`Spine ContextPlan changed the input identity ${messageId} to ${String(target.id)}`);
-    }
-    // Only human inputs receive a Spine UserAnchor; other legal user-role
-    // producers (goal, agent message, auto-continue, runtime context) keep
-    // their producer-owned source and content.
-    replacements.set(
-      messageId,
-      target.source.kind === "user"
-        ? withInputProvenance(target, original) as Extract<DeepSeekHarnessMessage, { role: "user" }>
-        : target,
-    );
-  }
-  return replacements;
 }
 
 function sourceKey(id: EpochOrdinalId): string {

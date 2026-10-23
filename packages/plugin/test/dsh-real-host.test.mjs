@@ -19,7 +19,6 @@ import {
   createDeepSeekHarnessSpineAdapter,
   DeepSeekHarnessSourceBindings,
   DeepSeekHarnessSurfacePublisher,
-  materializeDeepSeekHarnessContext,
   DeepSeekHarnessSamplingLifecycle,
   MemoryDeepSeekHarnessLedger,
   recoverDeepSeekHarnessSession,
@@ -502,7 +501,7 @@ test("synthetic developer events borrow the session's open turn and latest step"
   assert.deepEqual([freshEvent.data.turn, freshEvent.data.step], [1, 1]);
 });
 
-test("pre-step publishes the plan and rewrites the first request input before assembly", async () => {
+test("pre-step logs the input unchanged and anchors it model-only at the next publication", async () => {
   const { ctx, store, session } = liveSession("pre-step");
   const ledger = new MemoryDeepSeekHarnessLedger();
   const state = await recoverState(ctx, session, undefined, async () => ledger);
@@ -510,63 +509,86 @@ test("pre-step publishes the plan and rewrites the first request input before as
   const firstDecision = await preparePreStepDecision(state, async () => ({ kind: "enter", messages: [claimed] }),
   );
   assert.equal(firstDecision.kind, "enter");
-  const rewritten = firstDecision.messages[0];
-  assert.ok(rewritten, "the current input must be rewritten to the materialized message");
-  assert.notEqual(rewritten.content[0].text, claimed.content[0].text);
+  const logged = firstDecision.messages[0];
+  assert.ok(logged, "the current input must be returned for the loop to log");
+  // The input keeps its original content: the human transcript renders
+  // append-origin events, so a user anchor must never enter them.
+  assert.equal(logged.content[0].text, "first input");
 
-  const preview = await state.lifecycle.preview();
-  const expected = materializeDeepSeekHarnessContext(preview, state.bindings);
-  // The loop appends the system prompt and then the decision messages.
+  // The loop appends the system prompt and then the decision messages. The
+  // first request therefore sees the input exactly as the user typed it.
   system(store, session);
-  const event = session.append("user/message", rewritten, { surfaceOp: "append" });
+  const event = session.append("user/message", logged, { surfaceOp: "append" });
   observeEvent(state, event);
   const requestMessages = session.deriveMessages();
-  assert.deepEqual(
-    requestMessages.filter((message) => message.role !== "system")
-      .map((message) => message.content[0].text),
-    expected.map((message) => message.content[0].text),
-    "the request text must equal the Spine materialized current input",
-  );
-  assert.equal(requestMessages.at(-1).content[0].text, rewritten.content[0].text);
+  assert.equal(requestMessages.at(-1).content[0].text, "first input");
 
   const seqBeforeFinish = session.seq;
   await state.lifecycle.beginSampling();
   await state.lifecycle.finishNow("completed");
-  assert.equal(session.seq, seqBeforeFinish, "an unchanged first plan must not append");
+  // The sampling-finish publication anchors the logged input model-only: one
+  // native replacement lands, and the append-origin event keeps the original.
+  assert.equal(session.seq, seqBeforeFinish + 1, "exactly the anchored replacement is appended");
   validateStoredEvents(session.header, structuredClone(session.snapshotEvents()));
-  assert.deepEqual(
-    session.deriveMessages().filter((message) => message.role !== "system")
-      .map((message) => message.content[0].text),
-    expected.map((message) => message.content[0].text),
-  );
+  assert.equal(session.deriveMessages().at(-1).content[0].text, "[U1]\nfirst input");
 
-  // The next turn must publish the prior plan and rewrite the new input before
-  // its own request assembly.
+  // The next pre-step publishes the prior plan again; the anchored copy is
+  // already in place, so it is a no-op and the new input is returned unchanged.
   const claimedNext = user("u2", "second input");
   const nextDecision = await preparePreStepDecision(state, async () => ({ kind: "enter", messages: [claimedNext] }),
   );
   assert.equal(nextDecision.kind, "enter");
   const nextInput = nextDecision.messages[0];
   assert.ok(nextInput);
-  const nextPreview = await state.lifecycle.preview();
-  const nextExpected = materializeDeepSeekHarnessContext(nextPreview, state.bindings);
+  assert.equal(nextInput.content[0].text, "second input");
+  assertPositiveCoordinates(session);
+  const anchoredCopy = session.deriveMessages()
+    .find((message) => message.content[0].text.includes("first input"));
+  assert.equal(anchoredCopy.content[0].text, "[U1]\nfirst input");
+  const replacementEvents = session.snapshotEvents()
+    .filter((candidate) => candidate.type === "user/message" && candidate.data.id === "u1");
+  assert.equal(replacementEvents.length, 2, "one append-origin event plus one replacement copy");
+  assert.equal(replacementEvents[0].surfaceOp, "append");
+  assert.equal(replacementEvents[0].data.content[0].text, "first input");
+  assert.deepEqual(replacementEvents[1].surfaceOp, {
+    op: "replace",
+    startSeq: replacementEvents[0].seq,
+    endSeq: replacementEvents[0].seq,
+  });
+
   const nextEvent = session.append("user/message", nextInput, { surfaceOp: "append" });
   observeEvent(state, nextEvent);
-  assert.deepEqual(
-    session.deriveMessages().filter((message) => message.role !== "system")
-      .map((message) => message.content[0].text),
-    nextExpected.map((message) => message.content[0].text),
-  );
+  const derivedTexts = session.deriveMessages()
+    .filter((message) => message.role !== "system")
+    .map((message) => message.content[0].text);
+  assert.deepEqual(derivedTexts, ["[U1]\nfirst input", "second input"]);
+  await state.lifecycle.beginSampling();
+  await state.lifecycle.finishNow("completed");
   assert.equal(
     session.deriveMessages().filter((message) => message.content[0].text.includes("first input")).length,
     1,
     "the prior input must not be duplicated by the next plan",
   );
+
+  // The third pre-step sees both prior inputs anchored; its own input is
+  // returned unchanged and anchored at its sampling-finish publication.
+  const claimedThird = user("u3", "third input");
+  const thirdDecision = await preparePreStepDecision(state, async () => ({ kind: "enter", messages: [claimedThird] }),
+  );
+  assert.equal(thirdDecision.kind, "enter");
+  assert.equal(thirdDecision.messages[0].content[0].text, "third input");
+  assert.equal(
+    session.deriveMessages().filter((message) => message.content[0].text.includes("second input")).length,
+    1,
+    "the second input is anchored model-only exactly once",
+  );
+  const thirdEvent = session.append("user/message", thirdDecision.messages[0], { surfaceOp: "append" });
+  observeEvent(state, thirdEvent);
   await state.lifecycle.beginSampling();
   await state.lifecycle.finishNow("completed");
 
-  // Cold replay must observe the original input, not the presentation anchor,
-  // and must not republish or double-anchor.
+  // Cold replay must observe the original inputs, converge to the same
+  // anchored model view, and must not republish or double-anchor.
   const restoredContext = new Context();
   restoredContext.on("session/flush", () => {});
   const restoredStore = new SessionStore(restoredContext);
@@ -584,7 +606,7 @@ test("pre-step publishes the plan and rewrites the first request input before as
   assert.deepEqual(
     restored.deriveMessages().filter((message) => message.role !== "system")
       .map((message) => message.content[0].text),
-    nextExpected.map((message) => message.content[0].text),
+    ["[U1]\nfirst input", "[U2]\nsecond input", "[U3]\nthird input"],
   );
   assert.equal(restored.seq, restoredSeqBefore, "restored request must not republish");
   validateStoredEvents(restored.header, structuredClone(restored.snapshotEvents()));
