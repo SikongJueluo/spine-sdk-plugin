@@ -1,29 +1,32 @@
 import type {
   ReplayItem,
-  SamplingArchiveRecord,
   SourceSnapshot,
   SpineRuntimeClient,
 } from "@spinejit/spine-sdk";
+import type { SessionEvent } from "@deepseek-ai/dsh-session";
 
 import type { SpineHostAdapter } from "../host-adapter.js";
 import {
+  isDeepSeekHarnessMessageEvent,
+  isSpineContextMessage,
+  messageFromEvent,
+} from "./dsh.js";
+import {
   DEEPSEEK_HARNESS_ADAPTER_ID,
-  DEEPSEEK_HARNESS_ARCHIVE_EVENT,
-  DEEPSEEK_HARNESS_SPAWN_TERMINAL_EVENT,
   type DeepSeekHarnessArchiveEvent,
-  type DeepSeekHarnessSessionEvent,
 } from "./index.js";
 import {
   DeepSeekHarnessSourceBindings,
   observeDeepSeekHarnessMessage,
-  type DeepSeekHarnessMessage,
+  type DeepSeekHarnessSourceObservation,
 } from "./messages.js";
+import type { DeepSeekHarnessLedgerEntry } from "./ledger.js";
 
 export interface DeepSeekHarnessReplayPlan {
   runtimeThread: string;
   currentSessionId: string;
   inputs: ReplayItem[];
-  sources: Array<{ boundary: number; message: DeepSeekHarnessMessage }>;
+  sources: Array<{ boundary: number; observation: DeepSeekHarnessSourceObservation }>;
 }
 
 export interface RecoverDeepSeekHarnessSessionOptions {
@@ -42,50 +45,81 @@ export interface RecoveredDeepSeekHarnessSession {
 }
 
 export class DeepSeekHarnessRecoveryError extends Error {
-  constructor(message: string) {
-    super(message);
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
     this.name = "DeepSeekHarnessRecoveryError";
   }
 }
 
+/**
+ * Rebuild the Spine canonical replay from the real host log plus the private
+ * ledger.
+ *
+ * Only host-authored messages are sources. Published projection copies repeat
+ * an existing message identity, and derived Spine messages carry the
+ * `spine-context` source kind, so both are skipped: replay never re-admits
+ * output as new input. Ledger records carry the session sequence at which they
+ * became durable, which restores their position among the source events.
+ */
 export function buildDeepSeekHarnessReplayPlan(
   currentSessionId: string,
-  events: readonly DeepSeekHarnessSessionEvent[],
+  events: readonly SessionEvent[],
+  ledger: readonly DeepSeekHarnessLedgerEntry[] = [],
 ): DeepSeekHarnessReplayPlan {
-  const inputs: ReplayItem[] = [];
-  const sources: Array<{ boundary: number; message: DeepSeekHarnessMessage }> = [];
+  type Operation =
+    | { position: number; tie: number; item: ReplayItem; source: null }
+    | { position: number; tie: number; item: ReplayItem; source: { boundary: number; observation: DeepSeekHarnessSourceObservation } };
+
+  const operations: Operation[] = [];
   let firstArchiveThread: string | null = null;
   let boundary = 0;
+  const seen = new Set<string>();
+
+  for (const entry of ledger) {
+    if (entry.kind !== "archive") continue;
+    const archive = entry.archive as DeepSeekHarnessArchiveEvent;
+    validateArchive(archive);
+    firstArchiveThread ??= archive.record.record.attempt_id.thread;
+    operations.push({
+      position: entry.anchorSeq * 2,
+      tie: entry.ordinal,
+      item: { type: "archive", record: archive.record },
+      source: null,
+    });
+  }
+
   for (const event of events) {
     if (event.type.startsWith("compaction/")) {
       throw new DeepSeekHarnessRecoveryError(
         `DSH native compaction event ${event.type} violates Spine compaction ownership`,
       );
     }
-    if (event.type === DEEPSEEK_HARNESS_ARCHIVE_EVENT) {
-      const archive = decodeArchive(event.data);
-      firstArchiveThread ??= archive.record.record.attempt_id.thread;
-      inputs.push({ type: "archive", record: archive.record });
-      continue;
-    }
-    if (
-      event.type === "surface/projection" ||
-      event.type === DEEPSEEK_HARNESS_SPAWN_TERMINAL_EVENT
-    ) {
-      continue;
-    }
-    const message = eventMessage(event);
-    if (message === null) continue;
-    const observation = observeDeepSeekHarnessMessage(message, boundary);
-    inputs.push({ type: "source", character: observation.character });
-    sources.push({ boundary, message: observation.message });
+    if (!isDeepSeekHarnessMessageEvent(event)) continue;
+    if (event.type === "system/message" || event.type === "developer/message") continue;
+    const message = messageFromEvent(event);
+    if (isSpineContextMessage(message)) continue;
+    if (seen.has(message.id)) continue;
+    seen.add(message.id);
+    const observation = observeDeepSeekHarnessMessage(message, boundary, event);
+    operations.push({
+      position: event.seq * 2 + 1,
+      tie: 0,
+      item: { type: "source", character: observation.character },
+      source: { boundary, observation },
+    });
     boundary += 1;
   }
+
+  operations.sort((left, right) =>
+    left.position - right.position || left.tie - right.tie);
   return {
     runtimeThread: firstArchiveThread ?? currentSessionId,
     currentSessionId,
-    inputs,
-    sources,
+    inputs: operations.map((operation) => operation.item),
+    sources: operations
+      .filter((operation): operation is Extract<Operation, { source: { boundary: number } }> =>
+        operation.source !== null)
+      .map((operation) => operation.source),
   };
 }
 
@@ -126,65 +160,46 @@ export async function recoverDeepSeekHarnessSession(
 export function installDeepSeekHarnessSourceBindings(
   bindings: DeepSeekHarnessSourceBindings,
   source: SourceSnapshot,
-  observations: readonly { boundary: number; message: DeepSeekHarnessMessage }[],
+  observations: readonly { boundary: number; observation: DeepSeekHarnessSourceObservation }[],
 ): void {
   if (source.cells.length !== observations.length) {
     throw new DeepSeekHarnessRecoveryError(
       `Spine source snapshot has ${source.cells.length} cells for ${observations.length} DSH messages`,
     );
   }
-  const byBoundary = new Map(observations.map((item) => [item.boundary, item.message]));
+  const byBoundary = new Map(observations.map((item) => [item.boundary, item.observation]));
   if (byBoundary.size !== observations.length) {
     throw new DeepSeekHarnessRecoveryError("DSH replay has duplicate source boundaries");
   }
   bindings.clear();
   for (const cell of source.cells) {
-    const message = byBoundary.get(cell.boundary);
-    if (message === undefined) {
+    const observation = byBoundary.get(cell.boundary);
+    if (observation === undefined) {
       throw new DeepSeekHarnessRecoveryError(
         `Spine source cell ${cell.source_id.ordinal} has unknown boundary ${cell.boundary}`,
       );
     }
-    bindings.bind(cell.source_id, message);
+    bindings.bind(cell.source_id, {
+      message: observation.message,
+      origin: observation.origin,
+    });
   }
 }
 
-function eventMessage(event: DeepSeekHarnessSessionEvent): DeepSeekHarnessMessage | null {
-  if (event.type === "user/message") return requireMessage(event.data, event.type);
-  if (event.type === "assistant/message" || event.type === "tool/result") {
-    if (!isRecord(event.data)) {
-      throw new DeepSeekHarnessRecoveryError(`${event.type} has no typed payload`);
-    }
-    return requireMessage(event.data.message, event.type);
-  }
-  return null;
-}
-
-function requireMessage(value: unknown, type: string): DeepSeekHarnessMessage {
+function validateArchive(archive: DeepSeekHarnessArchiveEvent): void {
   if (
-    !isRecord(value) ||
-    typeof value.id !== "string" ||
-    (value.role !== "system" && value.role !== "user" && value.role !== "assistant") ||
-    !Array.isArray(value.content) ||
-    !isRecord(value.source) ||
-    typeof value.source.kind !== "string"
-  ) {
-    throw new DeepSeekHarnessRecoveryError(`${type} has an invalid DSH Message`);
-  }
-  return value as unknown as DeepSeekHarnessMessage;
-}
-
-function decodeArchive(value: unknown): DeepSeekHarnessArchiveEvent {
-  if (
-    !isRecord(value) ||
-    value.schema !== DEEPSEEK_HARNESS_ADAPTER_ID ||
-    typeof value.durabilityId !== "string" ||
-    !isRecord(value.record) ||
-    !isRecord(value.record.record)
+    archive === null ||
+    typeof archive !== "object" ||
+    archive.schema !== DEEPSEEK_HARNESS_ADAPTER_ID ||
+    typeof archive.durabilityId !== "string" ||
+    archive.durabilityId.length === 0 ||
+    archive.record === null ||
+    typeof archive.record !== "object" ||
+    archive.record.record === null ||
+    typeof archive.record.record !== "object"
   ) {
     throw new DeepSeekHarnessRecoveryError("DSH Spine archive is malformed");
   }
-  const archive = value as unknown as DeepSeekHarnessArchiveEvent;
   const record = archive.record.record;
   if (
     archive.record.type !== "sampling_started" &&
@@ -193,15 +208,11 @@ function decodeArchive(value: unknown): DeepSeekHarnessArchiveEvent {
     throw new DeepSeekHarnessRecoveryError("DSH Spine archive type is unknown");
   }
   if (
-    !isRecord(record.attempt_id) ||
-    typeof record.attempt_id.thread !== "string" ||
-    record.attempt_id.thread.length === 0
+    typeof record.attempt_id !== "object" ||
+    record.attempt_id === null ||
+    typeof (record.attempt_id as { thread?: unknown }).thread !== "string" ||
+    ((record.attempt_id as { thread: string }).thread).length === 0
   ) {
     throw new DeepSeekHarnessRecoveryError("DSH Spine archive identity is inconsistent");
   }
-  return archive;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
 }

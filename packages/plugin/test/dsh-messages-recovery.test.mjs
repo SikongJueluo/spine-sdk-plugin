@@ -19,15 +19,61 @@ const user = {
 };
 const tool = {
   id: "tool-1",
-  role: "user",
-  content: [{ type: "tool-result", toolCallId: "call-1", content: [] }],
+  role: "tool",
+  toolCallId: "call-1",
+  isError: false,
+  content: [{ type: "text", text: "ok" }],
   source: { kind: "tool", callId: "call-1" },
 };
 
-test("DSH message transport preserves native messages and canonical projections", () => {
+const userEvent = {
+  type: "user/message",
+  seq: 0,
+  time: 1,
+  data: user,
+  surfaceOp: "append",
+};
+const toolEvent = {
+  type: "tool/result",
+  seq: 1,
+  time: 2,
+  data: { turn: 1, step: 1, message: tool },
+  surfaceOp: "append",
+};
+
+function archiveEntry(anchorSeq, ordinal, thread = "old") {
+  return {
+    kind: "archive",
+    anchorSeq,
+    ordinal,
+    archive: {
+      schema: "spine-plugin/deepseek-harness/v1",
+      durabilityId: `archive-${ordinal}`,
+      record: {
+        type: "sampling_started",
+        record: {
+          schema: "spine.sampling.started",
+          attempt_id: { thread, value: "attempt" },
+          epoch: 0,
+          pre_boundary: { thread, epoch: 0, ordinal: 1 },
+          previous_commit_id: null,
+          prompt_digest: "prompt",
+          source_digest: "source",
+          record_digest: "started",
+        },
+      },
+    },
+  };
+}
+
+test("DSH message transport preserves native tool messages and canonical projections", () => {
   assert.equal(observeDeepSeekHarnessMessage(tool, 1).character.type, "opaque");
+  assert.equal(observeDeepSeekHarnessMessage(tool, 1).character.boundary, 1);
   const bindings = new DeepSeekHarnessSourceBindings();
-  bindings.bind({ thread: "s", epoch: 0, ordinal: 0 }, user);
+  bindings.bind(
+    { thread: "s", epoch: 0, ordinal: 0 },
+    { message: user, origin: userEvent },
+  );
   const messages = materializeDeepSeekHarnessContext({
     transactionId: "tx",
     projection: { nodes: [], cursor: [], visible_context: [], last_boundary: 1 },
@@ -56,36 +102,61 @@ test("DSH message transport preserves native messages and canonical projections"
     },
   }, bindings);
   assert.equal(messages[0].content[0].text, "[U3]\nhello");
+  assert.deepEqual(messages[1].source, { kind: "spine-context", form: "recall" });
   assert.match(messages[1].content[0].text, /<spine_memory node_id="1">/);
   assert.equal(user.content[0].text, "hello");
 });
 
-test("DSH replay plan preserves physical source/archive order and ignores derived projection", () => {
-  const archive = startedArchive("old");
+test("DSH replay merges ledger archives at their durable session cut", () => {
   const plan = buildDeepSeekHarnessReplayPlan("fork", [
-    { type: "user/message", data: user },
-    { type: "spine/archive", data: archive },
-    { type: "surface/projection", data: {} },
-    { type: "tool/result", data: { message: tool } },
+    userEvent,
+    { type: "step/start", seq: 2, time: 3, data: { turn: 1, step: 1 } },
+    { ...toolEvent, seq: 3 },
+  ], [
+    archiveEntry(1, 0),
   ]);
   assert.equal(plan.runtimeThread, "old");
   assert.deepEqual(plan.inputs.map((item) => item.type), ["source", "archive", "source"]);
-  assert.equal(plan.sources.length, 2);
+  assert.deepEqual(plan.sources.map((item) => item.boundary), [0, 1]);
+  assert.equal(plan.sources[0].observation.message.id, "user-1");
+  assert.equal(plan.sources[1].observation.message.id, "tool-1");
+});
+
+test("DSH replay skips published copies and derived Spine context messages", () => {
+  const publishedCopy = { ...userEvent, seq: 4 };
+  const derived = {
+    type: "user/message",
+    seq: 5,
+    time: 6,
+    data: {
+      id: "spine:summary",
+      role: "user",
+      content: [{ type: "text", text: "summary" }],
+      source: { kind: "spine-context", form: "recall" },
+    },
+    surfaceOp: "append",
+  };
+  const plan = buildDeepSeekHarnessReplayPlan("s", [
+    userEvent,
+    publishedCopy,
+    derived,
+  ]);
+  assert.equal(plan.sources.length, 1);
+  assert.equal(plan.sources[0].observation.message.id, "user-1");
 });
 
 test("DSH replay rejects native compaction ownership violations", () => {
   assert.throws(
-    () => buildDeepSeekHarnessReplayPlan("s", [{ type: "compaction/compact", data: {} }]),
+    () => buildDeepSeekHarnessReplayPlan("s", [
+      { type: "compaction/start", seq: 0, time: 0, data: {} },
+    ]),
     DeepSeekHarnessRecoveryError,
   );
 });
 
 test("DSH recovery binds exact replay cells before publication and continues fork namespace", async () => {
   const log = [];
-  const plan = buildDeepSeekHarnessReplayPlan("fork", [
-    { type: "user/message", data: user },
-    { type: "spine/archive", data: startedArchive("old") },
-  ]);
+  const plan = buildDeepSeekHarnessReplayPlan("fork", [userEvent], [archiveEntry(1, 0)]);
   const source = {
     schema: "spine.source.snapshot.v1",
     thread: "old",
@@ -121,7 +192,8 @@ test("DSH recovery binds exact replay cells before publication and continues for
     adapterFactory: async () => adapter,
   });
   assert.deepEqual(log, ["replay", "publish", "continue:fork", "fork-publish"]);
-  assert.equal(recovered.bindings.resolve({ thread: "fork", epoch: 0, ordinal: 0 }).id, "user-1");
+  assert.equal(recovered.bindings.resolve({ thread: "fork", epoch: 0, ordinal: 0 }).message.id, "user-1");
+  assert.equal(recovered.bindings.origin("user-1").seq, 0);
 });
 
 test("DSH source installation fails closed on boundary mismatch", () => {
@@ -137,7 +209,7 @@ test("DSH source installation fails closed on boundary mismatch", () => {
         item: { Message: { message: { boundary: 9, role: "User", content: "{}" }, user_anchor: null } },
       }],
     },
-    [{ boundary: 0, message: user }],
+    [{ boundary: 0, observation: observeDeepSeekHarnessMessage(user, 0, userEvent) }],
   ), DeepSeekHarnessRecoveryError);
 });
 
@@ -158,22 +230,29 @@ test("DSH recovery disposes the adapter when replay fails", async () => {
   assert.equal(disposals, 1);
 });
 
-function startedArchive(thread) {
-  return {
-    schema: "spine-plugin/deepseek-harness/v1",
-    durabilityId: "started",
-    record: {
-      type: "sampling_started",
-      record: {
-        schema: "spine.sampling.started",
-        attempt_id: { thread, value: "attempt" },
-        epoch: 0,
-        pre_boundary: { thread, epoch: 0, ordinal: 1 },
-        previous_commit_id: null,
-        prompt_digest: "prompt",
-        source_digest: "source",
-        record_digest: "started",
-      },
-    },
+test("Spine anchors human user messages but not producer-owned context", () => {
+  const bindings = new DeepSeekHarnessSourceBindings();
+  const goal = {
+    id: "goal-1",
+    role: "user",
+    source: { kind: "goal" },
+    content: [{ type: "text", text: "continue goal" }],
   };
-}
+  bindings.bind({ thread: "s", epoch: 0, ordinal: 0 }, { message: goal, origin: null });
+  const messages = materializeDeepSeekHarnessContext({
+    transactionId: null,
+    projection: { nodes: [], cursor: [], visible_context: [], last_boundary: null },
+    contextPlan: {
+      schema: "spine.context.plan.v2",
+      thread: "s",
+      epoch: 0,
+      cells: [{
+        type: "source",
+        source_id: { thread: "s", epoch: 0, ordinal: 0 },
+        labels: [{ UserAnchor: 1 }],
+      }],
+    },
+  }, bindings);
+  assert.equal(messages[0].content[0].text, "continue goal");
+  assert.deepEqual(messages[0].source, { kind: "goal" });
+});

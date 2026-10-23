@@ -113,8 +113,16 @@ export class SpineHostAdapter {
     return this.#controller.replayWithSources(inputs, installSources);
   }
 
+  preview(): Promise<PublishedContext> {
+    return this.#controller.preview();
+  }
+
   previewAndPublish(): Promise<PublishedContext> {
     return this.#controller.previewAndPublish();
+  }
+
+  publish(context: PublishedContext): Promise<void> {
+    return this.#controller.publish(context);
   }
 
   sourceSnapshot(): Promise<SourceSnapshot> {

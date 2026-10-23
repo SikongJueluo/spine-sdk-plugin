@@ -6,22 +6,26 @@ import type {
 } from "@spinejit/spine-sdk";
 
 import type { PublishedContext } from "../controller.js";
+import {
+  SPINE_CONTEXT_SOURCE_KIND,
+  originalInputMessage,
+  withInputProvenance,
+  type DeepSeekHarnessMessage,
+  type DeepSeekHarnessMessageEvent,
+} from "./dsh.js";
 
-export interface DeepSeekHarnessContentBlock {
-  readonly type: string;
-  readonly [key: string]: unknown;
-}
+export type DeepSeekHarnessContentBlock = DeepSeekHarnessMessage["content"][number];
 
-export interface DeepSeekHarnessMessage {
-  readonly id: string;
-  readonly role: "system" | "user" | "assistant";
-  readonly content: readonly DeepSeekHarnessContentBlock[];
-  readonly source: { readonly kind: string; readonly [key: string]: unknown };
-}
-
+/** A host message plus the durable event it was first observed in. */
 export interface DeepSeekHarnessSourceObservation {
   character: SourceCharacter;
   message: DeepSeekHarnessMessage;
+  origin: DeepSeekHarnessMessageEvent | null;
+}
+
+export interface DeepSeekHarnessBoundSource {
+  message: DeepSeekHarnessMessage;
+  origin: DeepSeekHarnessMessageEvent | null;
 }
 
 export class DeepSeekHarnessContextError extends Error {
@@ -32,46 +36,78 @@ export class DeepSeekHarnessContextError extends Error {
 }
 
 export class DeepSeekHarnessSourceBindings {
-  readonly #messages = new Map<string, DeepSeekHarnessMessage>();
+  readonly #messages = new Map<string, DeepSeekHarnessBoundSource>();
+  readonly #origins = new Map<string, DeepSeekHarnessMessageEvent>();
 
-  bind(sourceId: EpochOrdinalId, message: DeepSeekHarnessMessage): void {
+  bind(sourceId: EpochOrdinalId, source: DeepSeekHarnessBoundSource): void {
     const key = sourceIdKey(sourceId);
     if (this.#messages.has(key)) {
       throw new DeepSeekHarnessContextError(`duplicate DSH source binding ${key}`);
     }
-    this.#messages.set(key, structuredClone(message));
+    this.#messages.set(key, {
+      message: structuredClone(source.message),
+      origin: source.origin === null ? null : structuredClone(source.origin),
+    });
+    if (source.origin !== null && !this.#origins.has(source.message.id)) {
+      this.#origins.set(source.message.id, structuredClone(source.origin));
+    }
   }
 
-  resolve(sourceId: EpochOrdinalId): DeepSeekHarnessMessage {
-    const message = this.#messages.get(sourceIdKey(sourceId));
-    if (message === undefined) {
+  resolve(sourceId: EpochOrdinalId): DeepSeekHarnessBoundSource {
+    const source = this.#messages.get(sourceIdKey(sourceId));
+    if (source === undefined) {
       throw new DeepSeekHarnessContextError(
         `missing DSH message for source ${sourceIdKey(sourceId)}`,
       );
     }
-    return structuredClone(message);
+    return {
+      message: structuredClone(source.message),
+      origin: source.origin === null ? null : structuredClone(source.origin),
+    };
+  }
+
+  /** The first durable host event that produced one message identity. */
+  origin(messageId: string): DeepSeekHarnessMessageEvent | null {
+    return this.#origins.get(messageId) ?? null;
+  }
+
+  /** Attach the host event for a pre-admitted message once the loop logs it. */
+  setOrigin(messageId: string, origin: DeepSeekHarnessMessageEvent): void {
+    if (this.#origins.has(messageId)) return;
+    this.#origins.set(messageId, structuredClone(origin));
   }
 
   clear(): void {
     this.#messages.clear();
+    this.#origins.clear();
   }
 }
 
+/**
+ * Map one host message to the portable source vocabulary.
+ *
+ * DSH tool results are top-level `role: 'tool'` messages with their own
+ * `toolCallId`/`isError` fields; they are not user messages carrying a
+ * `tool-result` block. They stay opaque to Spine, exactly like Pi tool results.
+ */
 export function observeDeepSeekHarnessMessage(
   message: DeepSeekHarnessMessage,
   boundary: number,
+  origin: DeepSeekHarnessMessageEvent | null = null,
 ): DeepSeekHarnessSourceObservation {
-  if (message.source.kind === "tool") {
-    return { character: { type: "opaque", boundary }, message };
+  const observed = originalInputMessage(message) ?? message;
+  if (observed.role === "tool") {
+    return { character: { type: "opaque", boundary }, message: observed, origin };
   }
   return {
     character: {
       type: "message",
       boundary,
-      role: sourceRole(message),
-      content: stableJson(message),
+      role: sourceRole(observed),
+      content: stableJson(observed),
     },
-    message,
+    message: observed,
+    origin,
   };
 }
 
@@ -82,9 +118,15 @@ export function materializeDeepSeekHarnessContext(
   if (context.contextPlan === null) return [];
   return context.contextPlan.cells.map((cell) => {
     if (cell.type === "projection") return materializeProjection(cell);
-    let message = bindings.resolve(cell.source_id);
+    const bound = bindings.resolve(cell.source_id);
+    let message = bound.message;
     for (const label of cell.labels) {
       message = prependUserAnchor(message, label.UserAnchor);
+    }
+    if (cell.labels.length > 0 && message.role === "user" && message.source.kind === "user") {
+      // The anchor is a presentation rewrite of a human input. Keep the
+      // pre-anchor content so a logged replacement is replayable.
+      message = withInputProvenance(message, bound.message);
     }
     return message;
   });
@@ -132,19 +174,22 @@ function syntheticMessage(
     id: `spine:${cell.projection_id.thread}:${cell.projection_id.epoch}:${cell.projection_id.ordinal}`,
     role: "user",
     content: [{ type: "text", text }],
-    source: { kind: "plugin", plugin: "spine", form: "recall" },
-  };
+    source: { kind: SPINE_CONTEXT_SOURCE_KIND, form: "recall" },
+  } as unknown as DeepSeekHarnessMessage;
 }
 
 function prependUserAnchor(
   message: DeepSeekHarnessMessage,
   anchor: number,
 ): DeepSeekHarnessMessage {
-  if (message.role !== "user" || message.source.kind !== "user") {
+  if (message.role !== "user") {
     throw new DeepSeekHarnessContextError(
       `Spine user anchor U${anchor} targets a non-user DSH message`,
     );
   }
+  // Producer-owned user-role context (goal, agent-message, runtime context)
+  // stays contextual_user; only a human prompt receives the anchor.
+  if (message.source.kind !== "user") return message;
   const copy = structuredClone(message);
   const content = [...copy.content];
   const firstText = content.findIndex((block) => block.type === "text");
@@ -155,20 +200,18 @@ function prependUserAnchor(
     if (typeof block.text !== "string") {
       throw new DeepSeekHarnessContextError(`DSH text block for U${anchor} has no text`);
     }
-    content[firstText] = { ...block, text: `[U${anchor}]\n${block.text}` };
+    content[firstText] = { type: "text", text: `[U${anchor}]\n${block.text}` };
   }
   return { ...copy, content };
 }
 
 function sourceRole(
   message: DeepSeekHarnessMessage,
-): "user" | "contextual_user" | "assistant" | "system" {
+): "user" | "contextual_user" | "assistant" | "system" | "developer" {
   if (message.role === "assistant") return "assistant";
   if (message.role === "system") return "system";
+  if (message.role === "developer") return "developer";
   if (message.source.kind === "user") return "user";
-  if (message.source.kind === "tool") {
-    throw new DeepSeekHarnessContextError("DSH tool result must be admitted as opaque source");
-  }
   return "contextual_user";
 }
 

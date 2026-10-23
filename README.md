@@ -393,33 +393,51 @@ process has restarted.
 
 ## DeepSeek Harness extension
 
-`@spinejit/pi-spinejit/deepseek-harness` binds directly to the public
-`Session` and `SessionStore` contracts. It registers strict versioned codecs
-for `spine/archive` and `spine/spawn-terminal`, publishes the complete ordered
-model context through the core `surface/projection` event, and awaits
-`SessionStore.flush()` after every archive, terminal staging, and projection.
-Creation fails before sampling work when no durability listener participates.
+`@spinejit/pi-spinejit/deepseek-harness` targets **DSH `0.2.0-rc.2`**. It binds
+to the real public `Session`, `SessionStore`, message, tool, and event types
+from `@deepseek-ai/dsh-session`, `@deepseek-ai/dsh-llm`, and
+`@deepseek-ai/dsh-tools`; those packages are build-time `devDependencies`, so
+the published adapter imports no host package at runtime.
 
-The deployment composition supplies the ownership callback that disables or
-rejects every competing DSH context reducer and native compaction path. The
-adapter verifies this callback before creating its controller. Its disposer
-removes the required-event registration when the owning plugin/session scope
-ends. Complete durable Spawn staging can be recovered in canonical task order;
-partial, duplicate, or malformed staging fails closed.
+The adapter no longer writes `spine/archive`, `spine/spawn-terminal`, or
+`surface/projection` session events. DSH only accepts its build-time event
+vocabulary, cannot set `ignorable` through `Session.append`, and has no
+zero-to-many-message projection event. Spine state instead lives in a
+plugin-owned ledger opened through `ctx.storageDomain` (domain
+`spine_dsh_ledger`, `per-record` layout, one durable document per journal
+entry). The ordered model context is published through native surface events:
+
+- keep the protected system head and the longest content-equal prefix;
+- replace the divergent tail with one empty `developer/message` carrier;
+- append the planned messages with their original identities, including the
+  durable assistant `stream`/`usage` and tool-result payload.
+
+The pre-step waterfall's accepted decision is authoritative: replaced ids or
+content are projected, not the originally claimed payload. Only human
+`source.kind: "user"` inputs receive a Spine anchor; goal, agent-message,
+auto-continue, and runtime context keep their producer-owned source. A failed
+pre-admission discards the session state and rebuilds it from the log/ledger on
+the next step, so an unaccepted candidate cannot leak into a request.
+
+Publishing an unchanged plan is a no-op, so ordinary steps do not copy
+history. Every append batch is followed by `SessionStore.flush()`, and a host
+without a durability listener fails closed. Recovery replays host-authored
+messages plus ledger archives at their recorded session cuts, skips published
+copies and derived `spine-context` messages, and republishes only when the
+surface drifted.
 
 The loadable Cordis entry is
-`@spinejit/pi-spinejit/deepseek-harness/extension`. One DSH step is one
-sampling cycle: typed session messages are admitted as sources, `llm/stream`
-durably begins the attempt, typed native and Code Mode tool events stage Spine
-operations, and the next pre-step or turn-stopping boundary performs
-PostSampling. Request failures close the attempt before retry. Spawn uses the
-typed `ctx.subagents.start()` structured-output contract and requires a
-non-empty model-authored `memory` field.
+`@spinejit/pi-spinejit/deepseek-harness/extension`. It injects
+`storageDomain` and requires an isolated composition with **no native
+compaction provider**: Spine owns model context, so `compaction-basic` and the
+`/compact` command plugin (`command-compact`, which injects the compaction
+service) must not be composed alongside it. Tool calls and Code
+Mode (`tool/ptc-dispatch-start` / `tool/ptc-dispatch`) both stage Spine
+executions, and Spawn uses `ctx.subagents.start()` with a required structured
+`memory` field.
 
-The extension rejects a composed native compaction service at load and session
-recovery, and faults if any `compaction/*` event appears. DSH does not yet have
-a generic exclusive-owner registry, so deployments must keep native compaction
-and competing context reducers out of the Spine-enabled composition.
+See [DeepSeek Harness adapter](https://github.com/GhabiX/spine-sdk-plugin/blob/main/doc/DEEPSEEK_HARNESS.md) for the supported
+version, durable layout, recovery/fork behavior, migration, and known limits.
 
 ## Development source
 

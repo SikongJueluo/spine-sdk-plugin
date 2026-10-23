@@ -6,9 +6,11 @@ import {
   type SpawnTask,
   type SpineRuntimeClient,
 } from "@spinejit/spine-sdk";
+import type { Session, SessionStore } from "@deepseek-ai/dsh-session";
 
 import {
   createHostAdapter,
+  type HostArchiveEnvelope,
   type HostContextEnvelope,
   type HostOwnershipClaim,
   type PublishedContext,
@@ -16,33 +18,29 @@ import {
   type SpineHostAdapter,
 } from "../index.js";
 import { recoverStagedSpawnResults } from "../spawn.js";
+import type { DeepSeekHarnessMessage } from "./dsh.js";
+import {
+  type DeepSeekHarnessArchivePayload,
+  type DeepSeekHarnessLedger,
+  type DeepSeekHarnessLedgerEntry,
+} from "./ledger.js";
+import {
+  materializeDeepSeekHarnessContext,
+  type DeepSeekHarnessSourceBindings,
+} from "./messages.js";
+import {
+  DeepSeekHarnessDurabilityError,
+  DeepSeekHarnessSurfacePublisher,
+} from "./publisher.js";
 
+export * from "./dsh.js";
+export * from "./ledger.js";
 export * from "./lifecycle.js";
 export * from "./messages.js";
-export * from "./recovery.js";
-
-export * from "./messages.js";
+export * from "./publisher.js";
 export * from "./recovery.js";
 
 export const DEEPSEEK_HARNESS_ADAPTER_ID = "spine-plugin/deepseek-harness/v1" as const;
-export const DEEPSEEK_HARNESS_EVENT_OWNER = "spine" as const;
-export const DEEPSEEK_HARNESS_ARCHIVE_EVENT = "spine/archive" as const;
-export const DEEPSEEK_HARNESS_SURFACE_EVENT = "surface/projection" as const;
-export const DEEPSEEK_HARNESS_SPAWN_TERMINAL_EVENT = "spine/spawn-terminal" as const;
-
-export interface DeepSeekHarnessEventManifest {
-  owner: typeof DEEPSEEK_HARNESS_EVENT_OWNER;
-  schema: typeof DEEPSEEK_HARNESS_ADAPTER_ID;
-  events: Readonly<{
-    [DEEPSEEK_HARNESS_ARCHIVE_EVENT]: DeepSeekHarnessRequiredEventCodec;
-    [DEEPSEEK_HARNESS_SPAWN_TERMINAL_EVENT]: DeepSeekHarnessRequiredEventCodec;
-  }>;
-}
-
-export interface DeepSeekHarnessRequiredEventCodec {
-  decode(data: JsonValue): void;
-}
-
 export interface DeepSeekHarnessArchiveEvent {
   schema: typeof DEEPSEEK_HARNESS_ADAPTER_ID;
   durabilityId: string;
@@ -55,229 +53,124 @@ export interface DeepSeekHarnessSpawnTerminalEvent {
   result: SpawnResult;
 }
 
-export interface DeepSeekHarnessSpinePort<TMessage> {
-  registerRequiredEventOwner?(manifest: DeepSeekHarnessEventManifest): () => void;
+/**
+ * Host-facing Spine port for one DSH session.
+ *
+ * Archive and staging records go to the plugin-owned durable ledger, never into
+ * the session log: the host accepts only its build-time event vocabulary and
+ * offers no writer-controlled `ignorable` marker. Context publication uses
+ * native surface events through {@link DeepSeekHarnessSurfacePublisher}.
+ */
+export interface DeepSeekHarnessSpinePort {
   claimOwnership(claim: HostOwnershipClaim): Promise<void>;
-  appendRequiredEvent(
-    type: typeof DEEPSEEK_HARNESS_ARCHIVE_EVENT,
-    event: DeepSeekHarnessArchiveEvent,
-  ): Promise<void>;
-  appendRequiredEvent(
-    type: typeof DEEPSEEK_HARNESS_SPAWN_TERMINAL_EVENT,
-    event: DeepSeekHarnessSpawnTerminalEvent,
-  ): Promise<void>;
-  materializeContext(context: PublishedContext): Promise<readonly TMessage[]>;
-  publishAtomicSurface?(
-    context: HostContextEnvelope<TMessage>,
-  ): Promise<void>;
+  persistArchive(entry: HostArchiveEnvelope): Promise<void>;
+  persistSpawnTerminal(batchId: string, result: SpawnResult): Promise<void>;
+  materializeContext(context: PublishedContext): Promise<readonly DeepSeekHarnessMessage[]>;
+  publishAtomicSurface(context: HostContextEnvelope<DeepSeekHarnessMessage>): Promise<void>;
+  isPublishedSeq(seq: number): boolean;
 }
 
-export interface DeepSeekHarnessSurface {
-  readonly nodes: readonly number[];
-  readonly replaceGeneration: number;
+export interface CreateDeepSeekHarnessSessionPortOptions {
+  session: Session;
+  sessions: SessionStore;
+  ledger: DeepSeekHarnessLedger;
+  bindings: DeepSeekHarnessSourceBindings;
+  claimOwnership?(claim: HostOwnershipClaim): Promise<void>;
 }
 
-export interface DeepSeekHarnessSession<TMessage> {
-  readonly events: readonly DeepSeekHarnessSessionEvent[];
-  readonly surface: DeepSeekHarnessSurface;
-  append(type: typeof DEEPSEEK_HARNESS_ARCHIVE_EVENT, data: DeepSeekHarnessArchiveEvent): unknown;
-  append(type: typeof DEEPSEEK_HARNESS_SPAWN_TERMINAL_EVENT, data: DeepSeekHarnessSpawnTerminalEvent): unknown;
-  append(
-    type: typeof DEEPSEEK_HARNESS_ARCHIVE_EVENT | typeof DEEPSEEK_HARNESS_SPAWN_TERMINAL_EVENT,
-    data: DeepSeekHarnessArchiveEvent | DeepSeekHarnessSpawnTerminalEvent,
-  ): unknown;
-  append(type: typeof DEEPSEEK_HARNESS_SURFACE_EVENT, data: DeepSeekHarnessSurfaceProjection<TMessage>): unknown;
-}
+export { DeepSeekHarnessDurabilityError };
 
-export interface DeepSeekHarnessSessionEvent {
-  readonly type: string;
-  readonly data: unknown;
-}
-
-export interface DeepSeekHarnessSessionStore<TMessage> {
-  registerRequiredEventOwner(manifest: DeepSeekHarnessEventManifest): () => void;
-  flush(session: DeepSeekHarnessSession<TMessage>): Promise<boolean>;
-}
-
-export interface DeepSeekHarnessSurfaceProjection<TMessage> {
-  owner: typeof DEEPSEEK_HARNESS_EVENT_OWNER;
-  schema: typeof DEEPSEEK_HARNESS_ADAPTER_ID;
-  expectedGeneration: number;
-  planDigest: string;
-  provenance: number[];
-  messages: TMessage[];
-  payload: JsonValue;
-}
-
-export interface CreateDeepSeekHarnessSessionPortOptions<TMessage> {
-  session: DeepSeekHarnessSession<TMessage>;
-  sessions: DeepSeekHarnessSessionStore<TMessage>;
-  claimOwnership(claim: HostOwnershipClaim): Promise<void>;
-  materializeContext(context: PublishedContext): Promise<readonly TMessage[]>;
-  registerRequiredEventOwner?(manifest: DeepSeekHarnessEventManifest): () => void;
-}
-
-export class DeepSeekHarnessDurabilityError extends Error {
-  constructor() {
-    super("DeepSeek Harness has no session durability listener for the Spine session");
-    this.name = "DeepSeekHarnessDurabilityError";
-  }
-}
-
-export function createDeepSeekHarnessSessionPort<TMessage>(
-  options: CreateDeepSeekHarnessSessionPortOptions<TMessage>,
-): DeepSeekHarnessSpinePort<TMessage> {
-  const flush = async (): Promise<void> => {
-    if (!await options.sessions.flush(options.session)) {
-      throw new DeepSeekHarnessDurabilityError();
-    }
-  };
+export function createDeepSeekHarnessSessionPort(
+  options: CreateDeepSeekHarnessSessionPortOptions,
+): DeepSeekHarnessSpinePort {
+  const { session, sessions, ledger, bindings } = options;
+  const createdAt = session.header.createdAt;
+  const publisher = new DeepSeekHarnessSurfacePublisher(
+    session,
+    sessions,
+    (messageId) => bindings.origin(messageId),
+  );
   return {
-    registerRequiredEventOwner: (manifest) =>
-      (options.registerRequiredEventOwner ?? ((owner) =>
-        options.sessions.registerRequiredEventOwner(owner)))(manifest),
-    claimOwnership: async (claim) => {
-      await options.claimOwnership(claim);
-      await flush();
-    },
-    appendRequiredEvent: async (type, event) => {
-      options.session.append(type, event);
-      await flush();
-    },
-    materializeContext: (context) => options.materializeContext(context),
-    publishAtomicSurface: async (context) => {
-      if (context.contextPlan === null && context.messages.length === 0 && options.session.surface.nodes.length === 0) {
-        return;
-      }
-      options.session.append(DEEPSEEK_HARNESS_SURFACE_EVENT, {
-        owner: DEEPSEEK_HARNESS_EVENT_OWNER,
+    claimOwnership: (claim) => options.claimOwnership?.(claim) ?? Promise.resolve(),
+    persistArchive: async (entry) => {
+      const archive: DeepSeekHarnessArchivePayload = {
         schema: DEEPSEEK_HARNESS_ADAPTER_ID,
-        expectedGeneration: options.session.surface.replaceGeneration,
-        planDigest: context.contextPlan === null
-          ? "spine.context.plan"
-          : `${context.contextPlan.thread}:${context.contextPlan.epoch}:${context.contextPlan.cells.length}`,
-        provenance: [...options.session.surface.nodes],
-        messages: [...context.messages],
-        payload: assertJsonValue(context),
-      });
-      await flush();
-    },
-  };
-}
-
-export function createDeepSeekHarnessEventOwnerLeases(
-  register: (manifest: DeepSeekHarnessEventManifest) => () => void,
-): (manifest: DeepSeekHarnessEventManifest) => () => void {
-  let active: { manifest: DeepSeekHarnessEventManifest; dispose: () => void; leases: number } | null = null;
-  return (manifest) => {
-    if (active === null) {
-      active = { manifest, dispose: register(manifest), leases: 0 };
-    } else if (!sameManifest(active.manifest, manifest)) {
-      throw new Error("inconsistent DeepSeek Harness Spine required-event manifest");
-    }
-    const registration = active;
-    registration.leases += 1;
-    let disposed = false;
-    return () => {
-      if (disposed) return;
-      disposed = true;
-      registration.leases -= 1;
-      if (registration.leases === 0 && active === registration) {
-        active = null;
-        registration.dispose();
+        durabilityId: entry.durabilityId,
+        record: entry.record,
+      };
+      decodeArchiveEvent(archive as unknown as JsonValue);
+      // Never let the ledger get ahead of the host log: recovery merges the
+      // archive against source observations, so the sources it cites must be
+      // durable first. A crash after this flush loses only the archive.
+      if (!await sessions.flush(session)) {
+        throw new DeepSeekHarnessDurabilityError();
       }
-    };
-  };
-}
-
-export function createDeepSeekHarnessSpawnStagingStore<TMessage>(
-  host: DeepSeekHarnessSpinePort<TMessage>,
-): SpawnStagingStore {
-  return {
-    persistTerminal: (batchId, result) =>
-      host.appendRequiredEvent(DEEPSEEK_HARNESS_SPAWN_TERMINAL_EVENT, {
+      await ledger.appendArchive(session.id, createdAt, session.seq, archive);
+    },
+    persistSpawnTerminal: async (batchId, result) => {
+      decodeSpawnTerminalEvent({
         schema: DEEPSEEK_HARNESS_ADAPTER_ID,
         batchId,
         result,
-      }),
+      });
+      await ledger.appendSpawnTerminal(session.id, createdAt, session.seq, batchId, result);
+    },
+    materializeContext: (context) =>
+      Promise.resolve(materializeDeepSeekHarnessContext(context, bindings)),
+    publishAtomicSurface: async (context) => {
+      // A null plan means the host has no compiled context, not "the context is
+      // empty"; publishing it would hide live history.
+      if (context.contextPlan === null) return;
+      await publisher.publish(context.messages);
+    },
+    isPublishedSeq: (seq) => publisher.isOwnSeq(seq),
+  };
+}
+
+export function createDeepSeekHarnessSpawnStagingStore(
+  host: DeepSeekHarnessSpinePort,
+): SpawnStagingStore {
+  return {
+    persistTerminal: (batchId, result) => host.persistSpawnTerminal(batchId, result),
   };
 }
 
 export function recoverDeepSeekHarnessSpawnResults(
-  events: readonly DeepSeekHarnessSessionEvent[],
+  entries: readonly DeepSeekHarnessLedgerEntry[],
   batchId: string,
   tasks: readonly SpawnTask[],
 ): SpawnResult[] {
-  const staged = events
-    .filter((event) => event.type === DEEPSEEK_HARNESS_SPAWN_TERMINAL_EVENT)
-    .map((event) => decodeSpawnTerminalEvent(event.data))
-    .filter((event) => event.batchId === batchId)
-    .map((event) => event.result);
+  const staged = entries
+    .filter((entry): entry is Extract<DeepSeekHarnessLedgerEntry, { kind: "spawn-terminal" }> =>
+      entry.kind === "spawn-terminal")
+    .filter((entry) => entry.batchId === batchId)
+    .map((entry) => entry.result);
   return recoverStagedSpawnResults(tasks, staged);
 }
 
-export interface DeepSeekHarnessSpineAdapterOptions<TMessage> {
+export interface DeepSeekHarnessSpineAdapterOptions {
   enabled: boolean;
   runtime: SpineRuntimeClient;
-  host: DeepSeekHarnessSpinePort<TMessage>;
+  host: DeepSeekHarnessSpinePort;
 }
 
-export class DeepSeekHarnessCapabilityError extends Error {
-  readonly capability: "required-event-owner" | "atomic-surface-projection";
-
-  constructor(capability: DeepSeekHarnessCapabilityError["capability"]) {
-    super(`DeepSeek Harness does not provide required Spine capability: ${capability}`);
-    this.name = "DeepSeekHarnessCapabilityError";
-    this.capability = capability;
-  }
-}
-
-export async function createDeepSeekHarnessSpineAdapter<TMessage>(
-  options: DeepSeekHarnessSpineAdapterOptions<TMessage>,
+export async function createDeepSeekHarnessSpineAdapter(
+  options: DeepSeekHarnessSpineAdapterOptions,
 ): Promise<SpineHostAdapter | null> {
   if (!options.enabled) {
     return null;
   }
-  const registerRequiredEventOwner = options.host.registerRequiredEventOwner;
-  if (registerRequiredEventOwner === undefined) {
-    throw new DeepSeekHarnessCapabilityError("required-event-owner");
-  }
-  const publishAtomicSurface = options.host.publishAtomicSurface;
-  if (publishAtomicSurface === undefined) {
-    throw new DeepSeekHarnessCapabilityError("atomic-surface-projection");
-  }
-
-  const unregister = registerRequiredEventOwner.call(options.host, {
-    owner: DEEPSEEK_HARNESS_EVENT_OWNER,
-    schema: DEEPSEEK_HARNESS_ADAPTER_ID,
-    events: {
-      [DEEPSEEK_HARNESS_ARCHIVE_EVENT]: { decode: decodeArchiveEvent },
-      [DEEPSEEK_HARNESS_SPAWN_TERMINAL_EVENT]: { decode: decodeSpawnTerminalEvent },
+  return createHostAdapter({
+    runtime: options.runtime,
+    host: {
+      claimOwnership: (claim) => options.host.claimOwnership(claim),
+      persistArchive: (entry) => options.host.persistArchive(entry),
+      context: {
+        materialize: (context) => options.host.materializeContext(context),
+        publishAtomic: (context) => options.host.publishAtomicSurface(context),
+      },
     },
   });
-
-  try {
-    return await createHostAdapter({
-      runtime: options.runtime,
-      dispose: unregister,
-      host: {
-        claimOwnership: (claim) => options.host.claimOwnership(claim),
-        persistArchive: (entry) =>
-          options.host.appendRequiredEvent(DEEPSEEK_HARNESS_ARCHIVE_EVENT, {
-            schema: DEEPSEEK_HARNESS_ADAPTER_ID,
-            durabilityId: entry.durabilityId,
-            record: entry.record,
-          }),
-        context: {
-          materialize: (context) => options.host.materializeContext(context),
-          publishAtomic: (context) => publishAtomicSurface.call(options.host, context),
-        },
-      },
-    });
-  } catch (error) {
-    unregister();
-    throw error;
-  }
 }
 
 function decodeArchiveEvent(data: JsonValue): void {
@@ -431,58 +324,8 @@ function decodeSpawnTerminalEvent(data: unknown): DeepSeekHarnessSpawnTerminalEv
   return data as unknown as DeepSeekHarnessSpawnTerminalEvent;
 }
 
-function assertJsonValue(value: unknown): JsonValue {
-  const ancestors = new Set<object>();
-  const visit = (candidate: unknown): void => {
-    if (
-      candidate === null ||
-      typeof candidate === "string" ||
-      typeof candidate === "boolean"
-    ) return;
-    if (typeof candidate === "number") {
-      if (!Number.isFinite(candidate) || Object.is(candidate, -0)) {
-        throw new Error("Spine context envelope contains a non-lossless JSON number");
-      }
-      return;
-    }
-    if (typeof candidate !== "object") {
-      throw new Error("Spine context envelope is not lossless JSON");
-    }
-    if (ancestors.has(candidate)) {
-      throw new Error("Spine context envelope contains a cycle");
-    }
-    ancestors.add(candidate);
-    if (Array.isArray(candidate)) {
-      for (let index = 0; index < candidate.length; index += 1) {
-        if (!Object.hasOwn(candidate, index)) {
-          throw new Error("Spine context envelope contains a sparse array");
-        }
-        visit(candidate[index]);
-      }
-    } else {
-      const prototype = Object.getPrototypeOf(candidate) as unknown;
-      if (prototype !== Object.prototype && prototype !== null) {
-        throw new Error("Spine context envelope contains a non-plain object");
-      }
-      for (const item of Object.values(candidate)) visit(item);
-    }
-    ancestors.delete(candidate);
-  };
-  visit(value);
-  return value as JsonValue;
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function sameManifest(
-  left: DeepSeekHarnessEventManifest,
-  right: DeepSeekHarnessEventManifest,
-): boolean {
-  return left.owner === right.owner &&
-    left.schema === right.schema &&
-    Object.keys(left.events).sort().join("\u0000") === Object.keys(right.events).sort().join("\u0000");
 }
 
 function isNonEmptyString(value: unknown): value is string {

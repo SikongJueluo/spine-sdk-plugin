@@ -348,6 +348,18 @@ export class SpineController {
     return context;
   }
 
+  /** Publish one already-computed context, e.g. the pre-request projection. */
+  async publish(context: PublishedContext): Promise<void> {
+    return this.#exclusive(async () => {
+      this.#assertHealthy();
+      try {
+        await this.#context.publish(context);
+      } catch (cause) {
+        throw this.#latch("publish", cause);
+      }
+    });
+  }
+
   async preview(): Promise<PublishedContext> {
     return this.#exclusive(async () => {
       const preview = expectResult(await this.#executeRuntime({ type: "preview" }), "preview");

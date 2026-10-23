@@ -1,21 +1,23 @@
-
 import type {
+  EpochOrdinalId,
   SourceSnapshot,
   SpawnResult,
   SpawnTask,
   Terminal,
 } from "@spinejit/spine-sdk";
+import type { SessionEvent } from "@deepseek-ai/dsh-session";
 
+import type { PublishedContext } from "../controller.js";
 import type { SpineHostAdapter } from "../host-adapter.js";
 import {
   decodeSpineSpawnTasks,
   isSpineToolName,
   operationFromSpineToolCall,
 } from "../tools.js";
+import type { DeepSeekHarnessMessage, DeepSeekHarnessMessageEvent } from "./dsh.js";
 import {
   DeepSeekHarnessSourceBindings,
   observeDeepSeekHarnessMessage,
-  type DeepSeekHarnessMessage,
 } from "./messages.js";
 
 export interface DeepSeekHarnessToolStart {
@@ -35,8 +37,14 @@ export class DeepSeekHarnessLifecycleError extends Error {
 export class DeepSeekHarnessSamplingLifecycle {
   readonly #adapter: SpineHostAdapter;
   readonly #bindings: DeepSeekHarnessSourceBindings;
+  readonly #isPublishedSeq: (seq: number) => boolean;
   readonly #executions = new Set<string>();
+  /** Every message identity admitted so far, including inputs admitted before logging. */
+  readonly #admitted = new Map<string, EpochOrdinalId>();
+  readonly #preAdmitted = new Set<string>();
+  readonly #logged = new Set<string>();
   #nextBoundary: number;
+  #replayCut: number;
   #samplingActive = false;
   #successfulStepPending = false;
   #inputTokens: number | undefined;
@@ -47,19 +55,41 @@ export class DeepSeekHarnessSamplingLifecycle {
     adapter: SpineHostAdapter,
     bindings: DeepSeekHarnessSourceBindings,
     source: SourceSnapshot,
+    options: {
+      /** Events below this sequence were already replayed from the host log. */
+      replayCut?: number;
+      /** Predicate marking events the adapter itself published. */
+      isPublishedSeq?: (seq: number) => boolean;
+    } = {},
   ) {
     this.#adapter = adapter;
     this.#bindings = bindings;
     this.#nextBoundary = nextSourceBoundary(source);
+    this.#replayCut = options.replayCut ?? 0;
+    this.#isPublishedSeq = options.isPublishedSeq ?? (() => false);
   }
 
   get fault(): unknown {
     return this.#fault ?? this.#adapter.fault;
   }
 
-  enqueueMessage(message: DeepSeekHarnessMessage, inputTokens?: number): void {
+  enqueueMessage(
+    message: DeepSeekHarnessMessage,
+    origin: DeepSeekHarnessMessageEvent | null,
+    inputTokens?: number,
+  ): void {
+    if (origin !== null && (origin.seq < this.#replayCut || this.#isPublishedSeq(origin.seq))) {
+      return;
+    }
+    if (this.#admitted.has(message.id)) {
+      // The pre-step admitted this input before the loop appended it. The host
+      // event is the acceptance evidence the publisher requires.
+      if (origin !== null) this.#bindings.setOrigin(message.id, origin);
+      this.#logged.add(message.id);
+      return;
+    }
     this.#enqueue(async () => {
-      const observation = observeDeepSeekHarnessMessage(message, this.#nextBoundary);
+      const observation = observeDeepSeekHarnessMessage(message, this.#nextBoundary, origin);
       const admitted = await this.#adapter.observeSources([observation.character]);
       const sourceId = admitted[0];
       if (admitted.length !== 1 || sourceId === undefined) {
@@ -67,10 +97,66 @@ export class DeepSeekHarnessSamplingLifecycle {
           `Spine admitted ${admitted.length} source IDs for one DSH message`,
         );
       }
-      this.#bindings.bind(sourceId, observation.message);
+      this.#bindings.bind(sourceId, {
+        message: observation.message,
+        origin: observation.origin,
+      });
+      this.#admitted.set(message.id, sourceId);
       this.#nextBoundary += 1;
       if (inputTokens !== undefined) this.#inputTokens = inputTokens;
     });
+  }
+
+  /**
+   * Admit the step's claimed user messages before the agent loop appends them,
+   * so a ContextPlan can be published before request assembly.
+   */
+  admitInput(
+    messages: readonly DeepSeekHarnessMessage[],
+  ): Promise<Array<{ messageId: string; sourceId: EpochOrdinalId; created: boolean }>> {
+    return this.#serialize(async () => {
+      this.#assertHealthy();
+      const admitted: Array<{ messageId: string; sourceId: EpochOrdinalId; created: boolean }> = [];
+      for (const message of messages) {
+        const existing = this.#admitted.get(message.id);
+        if (existing !== undefined) {
+          admitted.push({ messageId: message.id, sourceId: existing, created: false });
+          continue;
+        }
+        const observation = observeDeepSeekHarnessMessage(message, this.#nextBoundary, null);
+        const sourceIds = await this.#adapter.observeSources([observation.character]);
+        const sourceId = sourceIds[0];
+        if (sourceIds.length !== 1 || sourceId === undefined) {
+          throw new DeepSeekHarnessLifecycleError(
+            `Spine admitted ${sourceIds.length} source IDs for one DSH input`,
+          );
+        }
+        this.#bindings.bind(sourceId, {
+          message: observation.message,
+          origin: null,
+        });
+        this.#admitted.set(message.id, sourceId);
+        this.#preAdmitted.add(message.id);
+        this.#nextBoundary += 1;
+        admitted.push({ messageId: message.id, sourceId, created: true });
+      }
+      return admitted;
+    });
+  }
+
+  /** Synchronously record that a pre-admitted input's durable event arrived. */
+  noteLogged(messageId: string, origin?: DeepSeekHarnessMessageEvent): void {
+    if (!this.#preAdmitted.has(messageId)) return;
+    this.#logged.add(messageId);
+    if (origin !== undefined) this.#bindings.setOrigin(messageId, origin);
+  }
+
+  preview(): Promise<PublishedContext> {
+    return this.#serialize(() => this.#adapter.preview());
+  }
+
+  publish(context: PublishedContext): Promise<void> {
+    return this.#serialize(() => this.#adapter.publish(context));
   }
 
   enqueueToolStart(start: DeepSeekHarnessToolStart): boolean {
@@ -126,9 +212,10 @@ export class DeepSeekHarnessSamplingLifecycle {
     });
   }
 
-  async beginSampling(_request: unknown): Promise<void> {
+  async beginSampling(_request?: unknown): Promise<void> {
     await this.drain();
     await this.#serialize(async () => {
+      this.#assertInputsLogged();
       if (this.#samplingActive) {
         throw new DeepSeekHarnessLifecycleError("DSH began a request before the prior step ended");
       }
@@ -182,6 +269,10 @@ export class DeepSeekHarnessSamplingLifecycle {
   }
 
   async #finish(terminal: Terminal): Promise<void> {
+    // A pre-admitted input that never reached the log poisons the canonical
+    // source order; fault even when no sampling started (e.g. cancellation
+    // between pre-step and the user append).
+    this.#assertInputsLogged();
     if (!this.#samplingActive) return;
     if (this.#executions.size !== 0) {
       throw new DeepSeekHarnessLifecycleError(
@@ -229,6 +320,15 @@ export class DeepSeekHarnessSamplingLifecycle {
     }
   }
 
+  #assertInputsLogged(): void {
+    const missing = [...this.#preAdmitted].filter((id) => !this.#logged.has(id));
+    if (missing.length > 0) {
+      throw new DeepSeekHarnessLifecycleError(
+        `DSH pre-admitted input was never appended to the log: ${missing.join(", ")}`,
+      );
+    }
+  }
+
   #assertSamplingActive(): void {
     if (!this.#samplingActive) {
       throw new DeepSeekHarnessLifecycleError("DSH Spine operation occurred outside sampling");
@@ -253,4 +353,18 @@ function decodeToolInput(input: unknown): Record<string, unknown> {
 
 function nextSourceBoundary(source: SourceSnapshot): number {
   return source.cells.reduce((next, cell) => Math.max(next, cell.boundary + 1), 0);
+}
+
+/** Narrow a session event to the message event that produced it. */
+export function messageEventOf(
+  event: SessionEvent,
+): DeepSeekHarnessMessageEvent | null {
+  switch (event.type) {
+    case "user/message":
+    case "assistant/message":
+    case "tool/result":
+      return event;
+    default:
+      return null;
+  }
 }

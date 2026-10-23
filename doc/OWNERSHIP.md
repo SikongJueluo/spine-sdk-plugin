@@ -34,23 +34,20 @@ Two recovery capabilities are intentionally not simulated:
 Both cases fail closed. They are host integration gates, not alternate semantic
 paths.
 
-DeepSeek Harness provides runtime registration of required versioned extension
-events and the atomic durable zero-to-many-message `surface/projection` seam.
-The concrete adapter registers only `spine/archive` and
-`spine/spawn-terminal`; projection remains a core event. Every append is
-followed by the store-owned flush barrier, and absence of a durability listener
-is a hard capability failure.
+DeepSeek Harness publishes one model-visible surface derived from its own event
+log. It has no zero-to-many-message projection event and no out-of-repo session
+event vocabulary: extension records live in a plugin-owned
+`ctx.storageDomain` ledger, while context changes are compiled into native
+message events with `surfaceOp: { op: 'replace' }` plus appends. The adapter
+owns the differential publisher, the durable ledger, replay ordering at the
+recorded session cut, and fail-closed durability checks after every append
+batch. The host still owns the system prompt, tool history, request assembly,
+and session persistence.
 
-DSH has no generic ownership registry for context reducers and compaction. The
-deployment composition therefore owns that proof: before controller creation
-it must disable or reject competing context/compaction plugins through the
-adapter's ownership callback. This callback is capability enforcement, not a
-semantic reducer.
-
-The loadable DSH extension enforces the available half of that proof itself:
-it rejects an already-composed compaction provider, rechecks ownership while
-recovering every session, and fault-latches any observed `compaction/*` event.
-It maps only typed DSH session and lifecycle events. Successful `step/end` is a
-pending boundary, not an immediate commit; PostSampling runs at the awaited
-next `agent/pre-step` or `agent/turn-stopping`, so an exceptional request or
-turn boundary can still select the correct failed/cancelled terminal.
+The loadable DSH extension requires a composition with no native compaction
+provider. That is a deployment constraint, not a host capability claim: Spine
+replaces the model context, so a second context reducer cannot run beside it.
+Successful `step/end` is a pending boundary, not an immediate commit;
+PostSampling runs at the awaited next `agent/pre-step` or
+`agent/turn-stopping`, so an exceptional request or turn boundary can still
+select the correct failed/cancelled terminal.

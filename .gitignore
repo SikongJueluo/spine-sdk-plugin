@@ -2,3 +2,7 @@
 /node_modules/
 /packages/*/dist/
 *.tsbuildinfo
+/.npm-cache/
+/.scratch/
+temp/
+.dsh

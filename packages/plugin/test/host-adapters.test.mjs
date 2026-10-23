@@ -6,10 +6,6 @@ import { createNodeSpineRuntime } from "@spinejit/spine-sdk/node";
 import {
   createDeepSeekHarnessSpawnStagingStore,
   createDeepSeekHarnessSpineAdapter,
-  createDeepSeekHarnessSessionPort,
-  createDeepSeekHarnessEventOwnerLeases,
-  DeepSeekHarnessCapabilityError,
-  DeepSeekHarnessDurabilityError,
   recoverDeepSeekHarnessSpawnResults,
 } from "../dist/deepseek-harness/index.js";
 import { createPiSpawnStagingStore, createPiSpineAdapter } from "../dist/pi/index.js";
@@ -126,15 +122,17 @@ function hostRecorder(kind, log) {
   }
   return {
     ...common,
-    registerRequiredEventOwner(manifest) {
-      log.push(["register", manifest]);
-      return () => log.push(["unregister"]);
+    async persistArchive(entry) {
+      log.push(["archive", "spine/archive", entry]);
     },
-    async appendRequiredEvent(type, entry) {
-      log.push(["archive", type, entry]);
+    async persistSpawnTerminal(batchId, result) {
+      log.push(["archive", "spine/spawn-terminal", { batchId, result }]);
     },
     async publishAtomicSurface(context) {
-      log.push(["context", "surface/projection", context]);
+      log.push(["context", "surface", context]);
+    },
+    isPublishedSeq() {
+      return false;
     },
   };
 }
@@ -267,34 +265,6 @@ test("real WASM produces equivalent Pi and DSH archives and ContextPlan", async 
   );
 });
 
-test("DeepSeek Harness rejects missing required-event registration before side effects", async () => {
-  const log = [];
-  const host = hostRecorder("dsh", log);
-  delete host.registerRequiredEventOwner;
-
-  await assert.rejects(
-    createDeepSeekHarnessSpineAdapter({ enabled: true, runtime: runtime(log), host }),
-    (error) =>
-      error instanceof DeepSeekHarnessCapabilityError &&
-      error.capability === "required-event-owner",
-  );
-  assert.deepEqual(log, []);
-});
-
-test("DeepSeek Harness rejects missing atomic surface projection before side effects", async () => {
-  const log = [];
-  const host = hostRecorder("dsh", log);
-  delete host.publishAtomicSurface;
-
-  await assert.rejects(
-    createDeepSeekHarnessSpineAdapter({ enabled: true, runtime: runtime(log), host }),
-    (error) =>
-      error instanceof DeepSeekHarnessCapabilityError &&
-      error.capability === "atomic-surface-projection",
-  );
-  assert.deepEqual(log, []);
-});
-
 test("disabled host adapters preserve host identity", async () => {
   const options = {
     enabled: false,
@@ -327,176 +297,28 @@ test("Pi and DeepSeek Harness durably stage the same ordered spawn terminal", as
   );
 });
 
-test("concrete DeepSeek Harness port appends and flushes required records and atomic projection", async () => {
-  const log = [];
-  const session = {
-    events: [],
-    surface: { nodes: [2, 4], replaceGeneration: 3 },
-    append(type, data) {
-      log.push(["append", type, data]);
-      this.events.push({ type, data });
-      if (type === "surface/projection") {
-        this.surface = { nodes: [this.events.length - 1], replaceGeneration: 4 };
-      }
-    },
-  };
-  const sessions = {
-    registerRequiredEventOwner(manifest) {
-      log.push(["register", manifest]);
-      return () => log.push(["unregister"]);
-    },
-    async flush(value) {
-      assert.equal(value, session);
-      log.push(["flush"]);
-      return true;
-    },
-  };
-  const port = createDeepSeekHarnessSessionPort({
-    session,
-    sessions,
-    async claimOwnership(claim) { log.push(["ownership", claim]); },
-    async materializeContext() {
-      return [{ id: "message-1", role: "user", content: [], source: { kind: "user" } }];
-    },
-  });
-  const adapter = await createDeepSeekHarnessSpineAdapter({
-    enabled: true,
-    runtime: runtime(log),
-    host: port,
-  });
-
-  await adapter.beginSampling();
-  await adapter.finishSampling(trace.terminal);
-  const appends = log.filter(([kind]) => kind === "append");
-  assert.deepEqual(appends.map(([, type]) => type), [
-    "spine/archive",
-    "spine/archive",
-    "surface/projection",
-  ]);
-  assert.deepEqual(appends.at(-1)[2], {
-    owner: "spine",
-    schema: "spine-plugin/deepseek-harness/v1",
-    expectedGeneration: 3,
-    planDigest: "thread-1:0:0",
-    provenance: [2, 4],
-    messages: [{ id: "message-1", role: "user", content: [], source: { kind: "user" } }],
-    payload: {
-      schema: "spine-host-protocol/v1",
-      transactionId: "commit-1",
-      contextPlan: PLAN,
-      projection: PROJECTION,
-      messages: [{ id: "message-1", role: "user", content: [], source: { kind: "user" } }],
-    },
-  });
-  assert.equal(log.filter(([kind]) => kind === "flush").length, 4);
-  assert.deepEqual(Object.keys(log[0][1].events), ["spine/archive", "spine/spawn-terminal"]);
-  assert.throws(
-    () => log[0][1].events["spine/archive"].decode({
-      schema: "spine-plugin/deepseek-harness/v1",
-      durabilityId: "broken",
-      record: { type: "sampling_started", record: { record_digest: "broken" } },
-    }),
-    /archive identity|sampling-started/,
-  );
-  assert.throws(
-    () => log[0][1].events["spine/spawn-terminal"].decode({
-      schema: "spine-plugin/deepseek-harness/v1",
-      batchId: "batch",
-      result: { ordinal: -1, outcome: "completed", memory_body: "memory" },
-    }),
-    /terminal result/,
-  );
-  adapter.dispose();
-  adapter.dispose();
-  assert.equal(log.filter(([kind]) => kind === "unregister").length, 1);
-});
-
-test("concrete DeepSeek Harness port fails closed without a durability listener", async () => {
-  const session = { events: [], surface: { nodes: [], replaceGeneration: 0 }, append() {} };
-  const port = createDeepSeekHarnessSessionPort({
-    session,
-    sessions: {
-      registerRequiredEventOwner() { return () => {}; },
-      async flush() { return false; },
-    },
-    async claimOwnership() {},
-    async materializeContext() { return []; },
-  });
-  await assert.rejects(
-    createDeepSeekHarnessSpineAdapter({ enabled: true, runtime: runtime([]), host: port }),
-    DeepSeekHarnessDurabilityError,
-  );
-});
-
-test("concrete DeepSeek Harness port treats an empty null-plan replay as identity", async () => {
-  const session = {
-    events: [],
-    surface: { nodes: [], replaceGeneration: 0 },
-    append() { throw new Error("empty identity publication appended"); },
-  };
-  const port = createDeepSeekHarnessSessionPort({
-    session,
-    sessions: {
-      registerRequiredEventOwner() { return () => {}; },
-      async flush() { return true; },
-    },
-    async claimOwnership() {},
-    async materializeContext() { return []; },
-  });
-  await port.publishAtomicSurface({
-    schema: "spine-host-protocol/v1",
-    transactionId: null,
-    contextPlan: null,
-    projection: { nodes: [], cursor: [], visible_context: [], last_boundary: null },
-    messages: [],
-  });
-  assert.deepEqual(session.events, []);
-});
-
-test("DeepSeek Harness sessions share one required-event owner registration lease", () => {
-  let registrations = 0;
-  let disposals = 0;
-  const lease = createDeepSeekHarnessEventOwnerLeases(() => {
-    registrations += 1;
-    return () => { disposals += 1; };
-  });
-  const manifest = {
-    owner: "spine",
-    schema: "spine-plugin/deepseek-harness/v1",
-    events: {
-      "spine/archive": { decode() {} },
-      "spine/spawn-terminal": { decode() {} },
-    },
-  };
-  const first = lease(manifest);
-  const second = lease(manifest);
-  assert.equal(registrations, 1);
-  first();
-  assert.equal(disposals, 0);
-  second();
-  assert.equal(disposals, 1);
-});
-
-test("DeepSeek Harness recovers only a complete ordered durable Spawn receipt", () => {
+test("DeepSeek Harness recovers only a complete ordered ledger Spawn receipt", () => {
   const tasks = [
     { summary: "first", prompt: "one" },
     { summary: "second", prompt: "two" },
   ];
-  const terminal = (ordinal, memory) => ({
-    schema: "spine-plugin/deepseek-harness/v1",
+  const entry = (ordinal, memory) => ({
+    kind: "spawn-terminal",
     batchId: "batch-1",
+    ordinal,
+    anchorSeq: ordinal,
     result: { ordinal, outcome: "completed", memory_body: memory },
   });
-  const events = [
-    { type: "spine/spawn-terminal", data: terminal(1, "second memory") },
-    { type: "spine/spawn-terminal", data: terminal(0, "first memory") },
+  const entries = [
+    entry(1, "second memory"),
+    entry(0, "first memory"),
   ];
   assert.deepEqual(
-    recoverDeepSeekHarnessSpawnResults(events, "batch-1", tasks).map((result) => result.memory_body),
+    recoverDeepSeekHarnessSpawnResults(entries, "batch-1", tasks).map((result) => result.memory_body),
     ["first memory", "second memory"],
   );
   assert.throws(
-    () => recoverDeepSeekHarnessSpawnResults(events.slice(0, 1), "batch-1", tasks),
+    () => recoverDeepSeekHarnessSpawnResults(entries.slice(0, 1), "batch-1", tasks),
     /incomplete/,
   );
 });
