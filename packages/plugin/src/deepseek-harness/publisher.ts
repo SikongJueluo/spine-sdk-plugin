@@ -57,6 +57,7 @@ export class DeepSeekHarnessSurfacePublisher {
       session.snapshotEvents().map((event) => [event.seq, event]),
     );
 
+    const position = currentPosition(events.values());
     if (messages.length === 0) {
       const visible = nodes.some((node) => {
         const event = events.get(node);
@@ -131,7 +132,7 @@ export class DeepSeekHarnessSurfacePublisher {
 
     if (middleMessages.length === 0) {
       if (middleNodes.length > 0) {
-        this.#ownSeqs.add(this.#replaceWithCarrier(middleNodes).seq);
+        this.#ownSeqs.add(this.#replaceWithCarrier(middleNodes, position).seq);
         appended += 1;
       }
     } else if (
@@ -139,12 +140,12 @@ export class DeepSeekHarnessSurfacePublisher {
       middleMessages.length === 1 &&
       isReplacementCarrier(middleMessages[0]!)
     ) {
-      this.#ownSeqs.add(this.#replaceMessage(middleNodes, middleMessages[0]!).seq);
+      this.#ownSeqs.add(this.#replaceMessage(middleNodes, middleMessages[0]!, position).seq);
       appended += 1;
     } else {
       const replaced = nodes.slice(keep);
       if (replaced.length > 0) {
-        this.#ownSeqs.add(this.#replaceWithCarrier(replaced).seq);
+        this.#ownSeqs.add(this.#replaceWithCarrier(replaced, position).seq);
         appended += 1;
       }
       for (let index = next; index < messages.length; index += 1) {
@@ -154,7 +155,7 @@ export class DeepSeekHarnessSurfacePublisher {
             `Spine context plan publishes tool result ${String(message.toolCallId)} without its assistant tool call`,
           );
         }
-        this.#ownSeqs.add(this.#appendMessage(message).seq);
+        this.#ownSeqs.add(this.#appendMessage(message, position).seq);
         collectToolCalls(message, toolCalls);
         appended += 1;
       }
@@ -166,7 +167,10 @@ export class DeepSeekHarnessSurfacePublisher {
     return appended;
   }
 
-  #replaceWithCarrier(nodes: readonly SessionSeq[]): SessionEvent {
+  #replaceWithCarrier(
+    nodes: readonly SessionSeq[],
+    position: TurnStepPosition,
+  ): SessionEvent {
     const carrier = {
       id: `spine:carrier:${this.#session.id}:${this.#session.seq}`,
       role: "developer",
@@ -175,7 +179,7 @@ export class DeepSeekHarnessSurfacePublisher {
     } as unknown as Extract<DeepSeekHarnessMessage, { role: "developer" }>;
     return this.#session.append(
       "developer/message",
-      { turn: 0, step: 0, message: carrier },
+      { turn: position.turn, step: position.step, message: carrier },
       {
         surfaceOp: {
           op: "replace",
@@ -190,6 +194,7 @@ export class DeepSeekHarnessSurfacePublisher {
   #replaceMessage(
     nodes: readonly SessionSeq[],
     message: DeepSeekHarnessMessage,
+    position: TurnStepPosition,
   ): SessionEvent {
     const surfaceOp = {
       op: "replace" as const,
@@ -201,25 +206,32 @@ export class DeepSeekHarnessSurfacePublisher {
       case "user":
         this.#assertAcceptedInput(message);
         return this.#session.append("user/message", message, { surfaceOp, sourceEventSeqs });
-      case "developer":
+      case "developer": {
+        const origin = this.#origin(message.id);
         return this.#session.append("developer/message", {
-          turn: 0,
-          step: 0,
+          turn: origin?.type === "developer/message" ? origin.data.turn : position.turn,
+          step: origin?.type === "developer/message" ? origin.data.step : position.step,
           message,
+          ...(origin?.type === "developer/message" && origin.data.headerSeq !== undefined
+            ? { headerSeq: origin.data.headerSeq }
+            : {}),
         }, { surfaceOp, sourceEventSeqs });
-      case "system":
+      }
+      case "system": {
+        const origin = this.#origin(message.id);
         return this.#session.append("system/message", {
-          turn: 0,
-          step: 0,
+          turn: origin?.type === "system/message" ? origin.data.turn : position.turn,
+          step: origin?.type === "system/message" ? origin.data.step : position.step,
           message,
         }, { surfaceOp, sourceEventSeqs });
+      }
       case "assistant":
       case "tool":
         throw new Error(`DSH cannot replace a surface range with a ${message.role} message`);
     }
   }
 
-  #appendMessage(message: DeepSeekHarnessMessage): SessionEvent {
+  #appendMessage(message: DeepSeekHarnessMessage, position: TurnStepPosition): SessionEvent {
     const session = this.#session;
     switch (message.role) {
       case "user":
@@ -228,8 +240,8 @@ export class DeepSeekHarnessSurfacePublisher {
       case "developer": {
         const origin = this.#origin(message.id);
         return session.append("developer/message", {
-          turn: origin?.type === "developer/message" ? origin.data.turn : 0,
-          step: origin?.type === "developer/message" ? origin.data.step : 0,
+          turn: origin?.type === "developer/message" ? origin.data.turn : position.turn,
+          step: origin?.type === "developer/message" ? origin.data.step : position.step,
           message,
           ...(origin?.type === "developer/message" && origin.data.headerSeq !== undefined
             ? { headerSeq: origin.data.headerSeq }
@@ -239,8 +251,8 @@ export class DeepSeekHarnessSurfacePublisher {
       case "system": {
         const origin = this.#origin(message.id);
         return session.append("system/message", {
-          turn: origin?.type === "system/message" ? origin.data.turn : 0,
-          step: origin?.type === "system/message" ? origin.data.step : 0,
+          turn: origin?.type === "system/message" ? origin.data.turn : position.turn,
+          step: origin?.type === "system/message" ? origin.data.step : position.step,
           message,
         }, { surfaceOp: "append" });
       }
@@ -295,6 +307,33 @@ export class DeepSeekHarnessSurfacePublisher {
     }
     return origin as Extract<SessionEvent, { type: "assistant/message" | "tool/result" }>;
   }
+}
+
+/** The turn/step coordinates a synthetic event is admitted at. */
+interface TurnStepPosition {
+  turn: number;
+  step: number;
+}
+
+/**
+ * DSH session format v4 admits a `developer/message` only at a positive turn
+ * and step, and the persistence worker rejects the flush otherwise. Spine
+ * publishes between host steps, so synthetic events borrow the session's open
+ * turn and its latest started step; a log without turn markers (fresh or
+ * seeded before the first turn) falls back to the first position.
+ */
+function currentPosition(events: Iterable<SessionEvent>): TurnStepPosition {
+  let turn = 0;
+  let step = 0;
+  for (const event of events) {
+    if (event.type === "turn/start") {
+      turn = event.data.turn;
+      step = 0;
+    } else if (event.type === "step/start" && event.data.turn === turn) {
+      step = Math.max(step, event.data.step);
+    }
+  }
+  return { turn: Math.max(turn, 1), step: Math.max(step, 1) };
 }
 
 /** Stable structural comparison of two persisted messages. */

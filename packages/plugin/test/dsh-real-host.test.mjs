@@ -83,6 +83,21 @@ function originsOf(events) {
   return origins;
 }
 
+/** Mirror the host format-v4 admission rule the persistence worker enforces. */
+function assertPositiveCoordinates(session) {
+  for (const event of session.snapshotEvents()) {
+    if (event.type !== "developer/message") continue;
+    assert.ok(
+      Number.isSafeInteger(event.data.turn) && event.data.turn >= 1,
+      `developer/message at seq ${event.seq} must carry a positive turn, got ${String(event.data.turn)}`,
+    );
+    assert.ok(
+      Number.isSafeInteger(event.data.step) && event.data.step >= 1,
+      `developer/message at seq ${event.seq} must carry a positive step, got ${String(event.data.step)}`,
+    );
+  }
+}
+
 test("surface publisher compacts with native replace events and is idempotent", async () => {
   const { store, session } = liveSession("publish");
   system(store, session);
@@ -424,6 +439,7 @@ test("consecutive differing plans never drop a planned message behind a carrier"
     (id) => origins.get(id) ?? null,
   );
   assert.ok(await publisher.publish([user("A", "A"), user("B", "B")]) > 0);
+  assertPositiveCoordinates(session);
   assert.deepEqual(
     session.deriveMessages().map((message) => message.id),
     ["system-1", "A", "B"],
@@ -432,11 +448,58 @@ test("consecutive differing plans never drop a planned message behind a carrier"
     user("X", "X", { kind: "spine-context", form: "recall" }),
     user("B", "B"),
   ]) > 0);
+  assertPositiveCoordinates(session);
   assert.deepEqual(
     session.deriveMessages().map((message) => message.id),
     ["system-1", "X", "B"],
     "a planned message before a surviving tail must not be silently omitted",
   );
+});
+
+test("synthetic developer events borrow the session's open turn and latest step", async () => {
+  const { store, session } = liveSession("carrier-position");
+  session.append("turn/start", { turn: 1 });
+  session.append("step/start", { turn: 1, step: 1 });
+  system(store, session);
+  session.append("user/message", user("u1", "hello"), { surfaceOp: "append" });
+  session.append("assistant/message", {
+    turn: 1,
+    step: 1,
+    message: assistant("a1", "hi"),
+    stream: [],
+  }, { surfaceOp: "append" });
+  session.append("turn/end", { turn: 1, reason: { kind: "completed" } });
+  session.append("turn/start", { turn: 2 });
+
+  const origins = originsOf(session.snapshotEvents());
+  const publisher = new DeepSeekHarnessSurfacePublisher(
+    session,
+    store,
+    (id) => origins.get(id) ?? null,
+  );
+  // Pure deletion of the assistant node: one empty developer carrier replaces
+  // it, admitted at the open turn with that turn's latest started step.
+  assert.equal(await publisher.publish([user("u1", "hello")]), 1);
+  assertPositiveCoordinates(session);
+  const carrier = session.snapshotEvents().at(-1);
+  assert.equal(carrier.type, "developer/message");
+  assert.deepEqual([carrier.data.turn, carrier.data.step], [2, 1]);
+
+  // A log without turn markers still admits carriers at the first position.
+  const fresh = liveSession("carrier-fresh");
+  for (const id of ["u1", "X", "B"]) {
+    fresh.session.append("user/message", user(id, id), { surfaceOp: "append" });
+  }
+  const freshPublisher = new DeepSeekHarnessSurfacePublisher(
+    fresh.session,
+    fresh.store,
+    (id) => originsOf(fresh.session.snapshotEvents()).get(id) ?? null,
+  );
+  assert.equal(await freshPublisher.publish([user("u1", "u1"), user("B", "B")]), 1);
+  assertPositiveCoordinates(fresh.session);
+  const freshEvent = fresh.session.snapshotEvents().at(-1);
+  assert.equal(freshEvent.type, "developer/message");
+  assert.deepEqual([freshEvent.data.turn, freshEvent.data.step], [1, 1]);
 });
 
 test("pre-step publishes the plan and rewrites the first request input before assembly", async () => {
