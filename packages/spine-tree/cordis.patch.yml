@@ -1,0 +1,3 @@
+- insert:
+    - id: spine-tree
+      name: '@spinejit/dsh-spine-tree'

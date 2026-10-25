@@ -21,6 +21,13 @@ import {
   observeDeepSeekHarnessMessage,
 } from "./messages.js";
 
+/** Read-only notifications the inspection surface consumes; never affects sampling. */
+export interface DeepSeekHarnessLifecycleReporter {
+  context(context: PublishedContext, phase: "preview" | "publish" | "commit"): void;
+  activity(sampling: boolean, label: string | null): void;
+  fault(cause: unknown): void;
+}
+
 export interface DeepSeekHarnessToolStart {
   callId: string;
   name: string;
@@ -39,6 +46,7 @@ export class DeepSeekHarnessSamplingLifecycle {
   readonly #adapter: SpineHostAdapter;
   readonly #bindings: DeepSeekHarnessSourceBindings;
   readonly #isPublishedSeq: (seq: number) => boolean;
+  readonly #reporter: DeepSeekHarnessLifecycleReporter | undefined;
   readonly #executions = new Set<string>();
   /** Every message identity admitted so far, including inputs admitted before logging. */
   readonly #admitted = new Map<string, EpochOrdinalId>();
@@ -61,6 +69,8 @@ export class DeepSeekHarnessSamplingLifecycle {
       replayCut?: number;
       /** Predicate marking events the adapter itself published. */
       isPublishedSeq?: (seq: number) => boolean;
+      /** Read-only observation of the same transactions; never changes them. */
+      reporter?: DeepSeekHarnessLifecycleReporter;
     } = {},
   ) {
     this.#adapter = adapter;
@@ -68,6 +78,7 @@ export class DeepSeekHarnessSamplingLifecycle {
     this.#nextBoundary = nextSourceBoundary(source);
     this.#replayCut = options.replayCut ?? 0;
     this.#isPublishedSeq = options.isPublishedSeq ?? (() => false);
+    this.#reporter = options.reporter;
   }
 
   get fault(): unknown {
@@ -153,11 +164,18 @@ export class DeepSeekHarnessSamplingLifecycle {
   }
 
   preview(): Promise<PublishedContext> {
-    return this.#serialize(() => this.#adapter.preview());
+    return this.#serialize(async () => {
+      const context = await this.#adapter.preview();
+      this.#notifyContext(context, "preview");
+      return context;
+    });
   }
 
   publish(context: PublishedContext): Promise<void> {
-    return this.#serialize(() => this.#adapter.publish(context));
+    return this.#serialize(async () => {
+      await this.#adapter.publish(context);
+      this.#notifyContext(context, "publish");
+    });
   }
 
   enqueueToolStart(start: DeepSeekHarnessToolStart): boolean {
@@ -230,6 +248,7 @@ export class DeepSeekHarnessSamplingLifecycle {
       }
       await this.#adapter.beginSampling();
       this.#samplingActive = true;
+      this.#notifyActivity(true, "model request in flight");
       this.#inputTokens = undefined;
       this.#successfulStepPending = false;
       this.#executions.clear();
@@ -288,7 +307,15 @@ export class DeepSeekHarnessSamplingLifecycle {
         `DSH sampling ended with unfinished Spine executions: ${[...this.#executions].join(", ")}`,
       );
     }
-    await this.#adapter.finishSampling(terminal, this.#inputTokens);
+    const finished = await this.#adapter.finishSampling(terminal, this.#inputTokens);
+    if (finished !== null && finished !== undefined && finished.type === "committed") {
+      this.#notifyContext({
+        transactionId: finished.transactionId,
+        contextPlan: finished.contextPlan,
+        projection: finished.projection,
+      }, "commit");
+    }
+    this.#notifyActivity(false, null);
     this.#samplingActive = false;
     this.#successfulStepPending = false;
     this.#inputTokens = undefined;
@@ -317,6 +344,11 @@ export class DeepSeekHarnessSamplingLifecycle {
       return await operation();
     } catch (cause) {
       this.#fault ??= cause;
+      try {
+        this.#reporter?.fault(this.fault);
+      } catch {
+        // Observation must never change sampling behavior.
+      }
       throw new DeepSeekHarnessLifecycleError("DSH Spine lifecycle fault", { cause });
     }
   }
@@ -326,6 +358,22 @@ export class DeepSeekHarnessSamplingLifecycle {
       throw new DeepSeekHarnessLifecycleError("DSH Spine lifecycle is faulted", {
         cause: this.fault,
       });
+    }
+  }
+
+  #notifyContext(context: PublishedContext, phase: "preview" | "publish" | "commit"): void {
+    try {
+      this.#reporter?.context(context, phase);
+    } catch {
+      // A read-only view update must not fail the sampling transaction.
+    }
+  }
+
+  #notifyActivity(sampling: boolean, label: string | null): void {
+    try {
+      this.#reporter?.activity(sampling, label);
+    } catch {
+      // A read-only view update must not fail the sampling transaction.
     }
   }
 

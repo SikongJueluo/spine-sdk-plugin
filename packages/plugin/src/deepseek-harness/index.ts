@@ -33,12 +33,17 @@ import {
   DeepSeekHarnessSurfacePublisher,
 } from "./publisher.js";
 
+export * from "./audit.js";
 export * from "./dsh.js";
+export * from "./history.js";
+export * from "./inspection.js";
 export * from "./ledger.js";
 export * from "./lifecycle.js";
 export * from "./messages.js";
 export * from "./publisher.js";
 export * from "./recovery.js";
+export * from "./requests.js";
+export * from "./view.js";
 
 export const DEEPSEEK_HARNESS_ADAPTER_ID = "spine-plugin/deepseek-harness/v1" as const;
 export interface DeepSeekHarnessArchiveEvent {

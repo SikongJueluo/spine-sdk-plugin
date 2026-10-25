@@ -23,12 +23,24 @@ import {
   type DeepSeekHarnessSpinePort,
 } from "./index.js";
 import {
+  DeepSeekHarnessInspection,
+  SPINE_INSPECTION_SERVICE,
+  looksLikeLoopRequest,
+} from "./inspection.js";
+import { materializeDeepSeekHarnessContext } from "./messages.js";
+import {
+  DEFAULT_REQUEST_RETENTION,
+  openDeepSeekHarnessRequestStore,
+  type DeepSeekHarnessRequestStore,
+} from "./requests.js";
+import {
   openDeepSeekHarnessLedger,
   type DeepSeekHarnessLedger,
   type DeepSeekHarnessLedgerEntry,
 } from "./ledger.js";
 import {
   DeepSeekHarnessSamplingLifecycle,
+  type DeepSeekHarnessLifecycleReporter,
 } from "./lifecycle.js";
 import {
   type DeepSeekHarnessSourceBindings,
@@ -45,6 +57,12 @@ export interface Config {
   enabled?: boolean;
   configToml?: string;
   spawnProvider?: string;
+  /** Serve the read-only Spine Tree inspection service (default true). */
+  inspect?: boolean;
+  /** Capture frozen model requests as request evidence (default true). */
+  requestAudit?: boolean;
+  /** Captured requests retained per Session, oldest pruned first (default 100). */
+  requestRetention?: number;
 }
 
 interface DshAgent {
@@ -73,6 +91,7 @@ interface DshSubagents {
 }
 
 interface SessionState {
+  session: Session;
   lifecycle: DeepSeekHarnessSamplingLifecycle;
   runtime: NodeSpineRuntime;
   port: DeepSeekHarnessSpinePort;
@@ -98,20 +117,71 @@ export function apply(ctx: Context, config: Config = {}): void {
   const bySessionId = new Map<string, Promise<SessionState>>();
   const liveStates = new Set<Promise<SessionState>>();
   let ledgerPromise: Promise<DeepSeekHarnessLedger> | undefined;
+  let requestStorePromise: Promise<DeepSeekHarnessRequestStore> | undefined;
 
   const ledger = (): Promise<DeepSeekHarnessLedger> => {
     ledgerPromise ??= openDeepSeekHarnessLedger(ctx.storageDomain);
     return ledgerPromise;
   };
 
+  const requestStore = (): Promise<DeepSeekHarnessRequestStore> => {
+    requestStorePromise ??= openDeepSeekHarnessRequestStore(ctx.storageDomain, {
+      retention: config.requestRetention ?? DEFAULT_REQUEST_RETENTION,
+    });
+    return requestStorePromise;
+  };
+
+  const inspection = config.inspect === false
+    ? null
+    : new DeepSeekHarnessInspection({
+        ledger,
+        requests: config.requestAudit === false ? undefined : requestStore,
+        inspectSession: async (sessionId) => {
+          const controller = (ctx as unknown as {
+            get(name: string): unknown;
+          }).get("sessionController") as {
+            inspect(id: string): Promise<{
+              meta: { createdAt: number };
+              events: readonly SessionEvent[];
+            }>;
+          } | undefined;
+          if (controller === undefined) return null;
+          const found = await controller.inspect(sessionId);
+          return { events: found.events, createdAt: found.meta.createdAt };
+        },
+        runtimeFactory: (thread) => createNodeSpineRuntime({
+          thread,
+          features: ["jit", "spawn"],
+          ...(configToml === undefined ? {} : { configToml }),
+        }),
+      });
+  if (inspection !== null) {
+    inspection.start();
+    ctx.effect(() => {
+      const release = (ctx as unknown as {
+        provide(name: string, value: unknown): () => void;
+      }).provide(SPINE_INSPECTION_SERVICE, inspection);
+      return () => {
+        release();
+        void inspection.close();
+      };
+    }, "spine: read-only inspection service");
+  }
+
   const ensureState = (agent: DshAgent): Promise<SessionState> => {
     const existing = states.get(agent.session);
     if (existing !== undefined) return existing;
-    const recovering = recoverState(ctx, agent.session, configToml, ledger);
+    const reporter = inspection === null
+      ? undefined
+      : inspectionReporter(inspection, agent.session);
+    const recovering = recoverState(ctx, agent.session, configToml, ledger, reporter);
     states.set(agent.session, recovering);
     bySessionId.set(agent.session.id, recovering);
     liveStates.add(recovering);
-    void recovering.then((state) => resolvedStates.set(agent.session, state));
+    void recovering.then((state) => {
+      resolvedStates.set(agent.session, state);
+      inspection?.attach(agent.session);
+    });
     void recovering.catch(() => {
       if (states.get(agent.session) === recovering) states.delete(agent.session);
       if (bySessionId.get(agent.session.id) === recovering) bySessionId.delete(agent.session.id);
@@ -150,7 +220,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       : undefined;
     const state = sessionId === undefined ? undefined : bySessionId.get(String(sessionId));
     if (state === undefined) return next();
-    return beginThenStream(state, request, next);
+    return beginThenStream(state, request, next, inspection);
   }, { prepend: true });
 
   ctx.on("session/event", (session, event) => {
@@ -178,6 +248,7 @@ export function apply(ctx: Context, config: Config = {}): void {
   });
 
   ctx.on("session/disposed", (session) => {
+    inspection?.detach(String(session.id));
     const pending = states.get(session);
     states.delete(session);
     resolvedStates.delete(session);
@@ -203,6 +274,9 @@ export function apply(ctx: Context, config: Config = {}): void {
     if (ledgerPromise !== undefined) {
       await ledgerPromise.then((open) => open.close()).catch(() => undefined);
     }
+    if (requestStorePromise !== undefined) {
+      await requestStorePromise.then((open) => open.close()).catch(() => undefined);
+    }
   }, "spine: dispose DSH session runtimes");
 
   for (const toolName of SPINE_TOOL_NAMES) {
@@ -215,6 +289,7 @@ export async function recoverState(
   session: Session,
   configToml: string | undefined,
   ledger: () => Promise<DeepSeekHarnessLedger>,
+  reporter?: DeepSeekHarnessLifecycleReporter,
 ): Promise<SessionState> {
   let runtime: NodeSpineRuntime | undefined;
   let port: DeepSeekHarnessSpinePort | undefined;
@@ -261,9 +336,13 @@ export async function recoverState(
       recovered.adapter,
       recovered.bindings,
       recovered.source,
-      { replayCut, isPublishedSeq: port.isPublishedSeq },
+      {
+        replayCut,
+        isPublishedSeq: port.isPublishedSeq,
+        ...(reporter === undefined ? {} : { reporter }),
+      },
     );
-    return { lifecycle, runtime, port, bindings: recovered.bindings };
+    return { session, lifecycle, runtime, port, bindings: recovered.bindings };
   } catch (error) {
     runtime?.dispose();
     throw error;
@@ -397,10 +476,31 @@ async function* beginThenStream(
   state: Promise<SessionState>,
   request: unknown,
   next: () => AsyncIterable<StreamChunk>,
+  inspection: DeepSeekHarnessInspection | null,
 ): AsyncIterable<StreamChunk> {
   const resolved = await state;
+  if (inspection !== null && looksLikeLoopRequest(request, String(resolved.session.id))) {
+    // Capturing evidence is an observation: it must run before sampling starts,
+    // it must never block the model call, and a failure is reported, not thrown.
+    inspection.captureRequest(resolved.session, request, (plan, projection) =>
+      materializeDeepSeekHarnessContext(
+        { transactionId: null, contextPlan: plan, projection },
+        resolved.bindings,
+      ));
+  }
   await resolved.lifecycle.beginSampling(request);
   yield* next();
+}
+
+function inspectionReporter(
+  inspection: DeepSeekHarnessInspection,
+  session: Session,
+): DeepSeekHarnessLifecycleReporter {
+  return {
+    context: (context, phase) => inspection.reportContext(session, context, phase),
+    activity: (sampling, label) => inspection.reportActivity(session, sampling, label),
+    fault: (cause) => inspection.reportFault(session, cause),
+  };
 }
 
 export function observeEvent(state: SessionState, event: SessionEvent): void {

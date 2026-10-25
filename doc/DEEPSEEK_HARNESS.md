@@ -188,3 +188,18 @@ Concurrent writers to one session across processes are not supported. One
 process owns a live session; the ledger has no cross-process compare-and-swap.
 Do not share a writable DSH home between a live CLI and Web process for the
 same session.
+
+## Web inspection UI
+
+`packages/spine-tree` bundles the `Spine Tree` Conversation View and the two
+read-only routes it reads. It is additive: the Host half only registers
+`GET /api/spine.tree` and `GET /api/spine.request` and asks the extension for the
+provided `spineInspection` service, so the tab renders an explicit
+"host not enabled" state when the extension is absent.
+
+The extension provides `spineInspection` when its `inspect` config is not
+`false`, and captures frozen loop requests when `requestAudit` is not `false`.
+Captured request evidence lives in the `spine_dsh_audit` domain (retention:
+`requestRetention`, default 100 per session) and never enters the session log or
+`spine_dsh_ledger`. See [SPINE_TREE_UI.md](SPINE_TREE_UI.md) for the read-only
+guarantee, the audited layer, and the known limits.

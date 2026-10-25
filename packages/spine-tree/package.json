@@ -1,0 +1,32 @@
+{
+  "name": "@spinejit/dsh-spine-tree",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Read-only Spine Tree view and request audit for the DeepSeek Harness Web UI.",
+  "license": "Apache-2.0",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./routes": "./host/routes.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "host"
+  ]
+}
