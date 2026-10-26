@@ -19,6 +19,8 @@ import {
   leakedServices,
 } from "@deepseek-ai/dsh-agent-preset-registry";
 import { createScope } from "@deepseek-ai/dsh-scope";
+import { SystemPrompt, renderPrompt } from "@deepseek-ai/dsh-system-prompt";
+import { ToolRuntime } from "@deepseek-ai/dsh-tools";
 
 import { createSpineInspectionHost } from "../../spine-tree/host/broker.js";
 import * as spineTreeHost from "../../spine-tree/index.js";
@@ -44,6 +46,8 @@ async function harness(headers, options = {}) {
   const loader = ctx.plugin(Loader);
   await loader;
   await tick();
+  await ctx.plugin(SystemPrompt, { includeRuntimeContext: false });
+  await ctx.plugin(ToolRuntime, { mode: "native" });
 
   const opens = [];
   const closes = [];
@@ -65,7 +69,6 @@ async function harness(headers, options = {}) {
     llm: {},
     sessions: {},
     subagents: {},
-    tools: { register: () => () => {} },
     storageDomain,
   })) {
     ctx.provide(key, value);
@@ -279,6 +282,58 @@ test("a pending contribution does not survive preset unload", async () => {
   ctx.provide("spineInspectionHost", broker);
   await tick(20);
   assert.deepEqual(broker.describe(), [], "no closure from the unloaded preset remains");
+  await ctx.fiber.dispose();
+});
+
+test("a Spine preset assembles core workflow rules and the full catalog only in its scope", async () => {
+  const headers = new Map([
+    ["session-personal", { createdAt: 5, agentPreset: "personal" }],
+  ]);
+  const { ctx, loader } = await harness(headers);
+  const personalKey = {};
+  const otherKey = {};
+  const personalScope = createScope(loader.ctx, personalKey);
+  const otherScope = createScope(loader.ctx, otherKey);
+  await mountPreset(personalScope.ctx, "personal", [row("personal")]);
+  await tick(20);
+
+  const assembly = await ctx.systemPrompt.assemble({ scope: personalKey });
+  const rules = renderPrompt(assembly);
+  assert.match(rules, /<spine_instruction>/);
+  assert.match(rules, /spine_open/);
+  assert.match(rules, /Only one|at most one/);
+  assert.doesNotMatch(rules, /spine\.open/, "core's dotted default wording is adapted to DSH names");
+
+  const other = renderPrompt(await ctx.systemPrompt.assemble({ scope: otherKey }));
+  assert.doesNotMatch(other, /<spine_instruction>/, "another preset never inherits Spine's policy");
+
+  const agentKey = {};
+  const agentScope = createScope(loader.ctx, agentKey, { parent: personalKey });
+  assert.match(
+    renderPrompt(await ctx.systemPrompt.assemble({ scope: agentKey })),
+    /<spine_instruction>/,
+    "an agent scope inherits its preset's policy through the scope chain",
+  );
+  assert.ok(ctx.tools.get("spine_open", agentKey));
+
+  const open = ctx.tools.get("spine_open", personalKey);
+  assert.ok(open, "the catalog registers the DSH tool name");
+  assert.ok(open.description.length > 0);
+  assert.match(open.parameters.properties.goal.description, /Maximum 4096 characters/);
+  const spawn = ctx.tools.get("spine_spawn", personalKey);
+  assert.match(spawn.parameters.properties.tasks.description, /At least 2 items/);
+  assert.equal(ctx.tools.get("spine_open", otherKey), undefined);
+
+  await agentScope.dispose();
+  await personalScope.dispose();
+  await tick(20);
+  assert.doesNotMatch(
+    renderPrompt(await ctx.systemPrompt.assemble({ scope: personalKey })),
+    /<spine_instruction>/,
+    "unloading the preset removes its policy",
+  );
+
+  await otherScope.dispose();
   await ctx.fiber.dispose();
 });
 

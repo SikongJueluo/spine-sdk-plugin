@@ -34,6 +34,7 @@ import {
 } from "./publisher.js";
 
 export * from "./audit.js";
+export * from "./contract.js";
 export * from "./dsh.js";
 export * from "./history.js";
 export * from "./inspection.js";

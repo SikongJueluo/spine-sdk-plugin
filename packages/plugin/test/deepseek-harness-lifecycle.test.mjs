@@ -99,6 +99,7 @@ test("loadable DSH extension registers exactly the four canonical tools", () => 
     sessions: {},
     subagents: {},
     tools: { register(tool) { tools.push(tool); return () => {}; } },
+    systemPrompt: { getSectionOrder: () => 500, section: () => () => {} },
     get() { return undefined; },
     on(event, listener) { listeners.push([event, listener]); return () => {}; },
     effect() {},

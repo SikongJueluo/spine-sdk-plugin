@@ -698,6 +698,7 @@ test("the extension contributes its inspection to the Host broker over a cold Se
     sessions: {},
     subagents: {},
     tools: { register: () => () => {} },
+    systemPrompt: { getSectionOrder: () => 500, section: () => () => {} },
     storageDomain: {
       open: async () => ({
         table: () => ({

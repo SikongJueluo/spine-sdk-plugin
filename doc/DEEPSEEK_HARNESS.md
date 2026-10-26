@@ -23,6 +23,39 @@ there is no compatibility claim for `0.2.1-rc.x` or later.
 - `SessionStore.fork()` copies a prefix of the parent log; the private ledger
   is not forked automatically.
 
+## Model-facing contract
+
+The adapter consumes the SDK's single source of truth instead of maintaining a
+parallel catalog:
+
+- `runtime.extendSystemPrompt("")` supplies the canonical workflow policy and
+  `runtime.toolCatalog()` supplies each tool description and parameter schema.
+  Operation ids (`open`, …) map onto the registered `spine_*` names; core's
+  dotted default references (`spine.open`) are rewritten to those names. With
+  no `configToml`, the installed core default and `packages/plugin/spine.toml`
+  are identical after that mapping.
+- A scoped `systemPrompt.section` (`tool:spine`) renders the policy only while
+  all four tools are visible in the assembling scope. A restriction, a
+  disabled or unmounted preset, and plugin unload remove it with the tools.
+  It adds about 2.0k characters (roughly 500 tokens) per enabled request.
+- DSH's tool-parameter schema subset has no `maxLength` or `minItems`. The
+  adapter moves those constraints into the parameter description instead of
+  dropping them; the core still enforces both at execution.
+- The existing `<spine_node>` and `<spine_memory>` ContextPlan projections
+  remain the scope state the model reads. The adapter adds no second
+  "current branch" context.
+
+Admission uses the recovered or last committed projection cursor:
+
+- `spine_close` and `spine_next` at root return an ordinary erroneous tool
+  result with corrective text instead of a lifecycle fault.
+- One `spine_open`, `spine_close`, `spine_next`, or `spine_spawn` per model
+  response is admitted. A second transition gets an erroneous result and is
+  never staged; the core would otherwise accept the stage and fail the whole
+  sampling when it commits.
+- `execute()` and the `tool/call` event path share one admission record, so a
+  call cannot be staged twice and an aborted call leaves no execution.
+
 ## Durable layout
 
 Domain `spine_dsh_ledger`, version `1`, layout `per-record`, one table

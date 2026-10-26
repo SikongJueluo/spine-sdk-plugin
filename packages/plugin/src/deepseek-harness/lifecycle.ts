@@ -14,6 +14,7 @@ import {
   isSpineToolName,
   operationFromSpineToolCall,
   SpineToolInputError,
+  type SpineToolName,
 } from "../tools.js";
 import type { DeepSeekHarnessMessage, DeepSeekHarnessMessageEvent } from "./dsh.js";
 import {
@@ -41,6 +42,10 @@ export class DeepSeekHarnessLifecycleError extends Error {
   }
 }
 
+type ToolStartOutcome =
+  | { ok: true }
+  | { ok: false; error: SpineToolInputError };
+
 /** Owns one DSH step-to-Spine sampling transaction at a time. */
 export class DeepSeekHarnessSamplingLifecycle {
   readonly #adapter: SpineHostAdapter;
@@ -48,6 +53,12 @@ export class DeepSeekHarnessSamplingLifecycle {
   readonly #isPublishedSeq: (seq: number) => boolean;
   readonly #reporter: DeepSeekHarnessLifecycleReporter | undefined;
   readonly #executions = new Set<string>();
+  /** Admissions shared by the execute path and the session-event path. */
+  readonly #toolOutcomes = new Map<string, Promise<ToolStartOutcome>>();
+  /** Whether this sampling already reserved its one scope transition. */
+  #exclusiveStaged = false;
+  /** Number of nodes on the active cursor; 1 means the root coordinates. */
+  #activeDepth: number;
   /** Every message identity admitted so far, including inputs admitted before logging. */
   readonly #admitted = new Map<string, EpochOrdinalId>();
   readonly #preAdmitted = new Set<string>();
@@ -71,6 +82,8 @@ export class DeepSeekHarnessSamplingLifecycle {
       isPublishedSeq?: (seq: number) => boolean;
       /** Read-only observation of the same transactions; never changes them. */
       reporter?: DeepSeekHarnessLifecycleReporter;
+      /** Cursor length of the recovered projection; root is 1. */
+      activeDepth?: number;
     } = {},
   ) {
     this.#adapter = adapter;
@@ -79,6 +92,7 @@ export class DeepSeekHarnessSamplingLifecycle {
     this.#replayCut = options.replayCut ?? 0;
     this.#isPublishedSeq = options.isPublishedSeq ?? (() => false);
     this.#reporter = options.reporter;
+    this.#activeDepth = options.activeDepth ?? 1;
   }
 
   get fault(): unknown {
@@ -180,36 +194,27 @@ export class DeepSeekHarnessSamplingLifecycle {
 
   enqueueToolStart(start: DeepSeekHarnessToolStart): boolean {
     if (!isSpineToolName(start.name)) return false;
-    const toolName = start.name;
-    this.#enqueue(async () => {
-      this.#assertSamplingActive();
-      if (this.#executions.has(start.callId)) {
-        throw new DeepSeekHarnessLifecycleError(`duplicate DSH Spine tool call ${start.callId}`);
-      }
-      // Model-authored arguments are rejected, not faulted: the tool's own
-      // execute() surfaces the identical validation failure to the model as
-      // an erroneous tool result it may retry inside the same sampling. The
-      // call stays unregistered, so tool finish is a no-op.
-      try {
-        const input = decodeToolInput(start.arguments);
-        const operation = toolName === "spine_spawn"
-          ? null
-          : operationFromSpineToolCall(toolName, input);
-        if (toolName === "spine_spawn") decodeSpineSpawnTasks(input);
-        await this.#adapter.registerExecution(start.callId);
-        this.#executions.add(start.callId);
-        if (operation !== null) {
-          await this.#adapter.stageExecution(
-            start.callId,
-            start.callId,
-            operation,
-          );
-        }
-      } catch (cause) {
-        if (!(cause instanceof SpineToolInputError)) throw cause;
-      }
-    });
+    this.#admitToolStart(start.callId, start.name, start.arguments);
     return true;
+  }
+
+  /**
+   * Await the same admission the session-event path starts.
+   *
+   * `execute()` uses this so a rejected state transition becomes an ordinary
+   * erroneous tool result the model may correct inside the same sampling,
+   * instead of an accepted result followed by a lifecycle fault at commit.
+   * Whichever path arrives first owns the single admission; the other reuses
+   * its outcome.
+   */
+  async beginToolExecution(
+    callId: string,
+    name: SpineToolName,
+    argumentsJson: unknown,
+  ): Promise<void> {
+    const outcome = this.#toolOutcomes.get(callId) ?? this.#admitToolStart(callId, name, argumentsJson);
+    const result = await outcome;
+    if (!result.ok) throw result.error;
   }
 
   enqueueToolFinish(callId: string, succeeded: boolean): boolean {
@@ -219,6 +224,66 @@ export class DeepSeekHarnessSamplingLifecycle {
       this.#executions.delete(callId);
     });
     return true;
+  }
+
+  #admitToolStart(
+    callId: string,
+    name: SpineToolName,
+    argumentsJson: unknown,
+  ): Promise<ToolStartOutcome> {
+    const existing = this.#toolOutcomes.get(callId);
+    if (existing !== undefined) return existing;
+    const outcome = this.#enqueue(async (): Promise<ToolStartOutcome> => {
+      this.#assertSamplingActive();
+      if (this.#executions.has(callId)) {
+        throw new DeepSeekHarnessLifecycleError(`duplicate DSH Spine tool call ${callId}`);
+      }
+      // Model-authored arguments and illegal state transitions are rejected,
+      // not faulted: the tool's own execute() surfaces the identical message
+      // to the model as an erroneous tool result it may retry inside the same
+      // sampling. The call stays unregistered, so tool finish is a no-op.
+      try {
+        const input = decodeToolInput(argumentsJson);
+        const operation = name === "spine_spawn"
+          ? null
+          : operationFromSpineToolCall(name, input);
+        if (name === "spine_spawn") decodeSpineSpawnTasks(input);
+        this.#admitScopeTransition(name);
+        await this.#adapter.registerExecution(callId);
+        this.#executions.add(callId);
+        this.#exclusiveStaged = true;
+        if (operation !== null) {
+          await this.#adapter.stageExecution(callId, callId, operation);
+        }
+        return { ok: true };
+      } catch (cause) {
+        if (cause instanceof SpineToolInputError) return { ok: false, error: cause };
+        throw cause;
+      }
+    });
+    this.#toolOutcomes.set(callId, outcome);
+    void outcome.catch(() => undefined);
+    return outcome;
+  }
+
+  /**
+   * Reject transitions the runtime would otherwise accept at staging and fail
+   * only when the sampling commits. A model response gets one transition, and
+   * close/next require a non-root cursor.
+   */
+  #admitScopeTransition(name: SpineToolName): void {
+    if (this.#exclusiveStaged) {
+      throw new SpineToolInputError(
+        "Only one Spine scope transition (spine_open, spine_close, spine_next, or spine_spawn) is applied per model response. This call was not applied; continue in the current scope and issue the next transition in a later response.",
+      );
+    }
+    if ((name === "spine_close" || name === "spine_next") && this.#activeDepth <= 1) {
+      throw new SpineToolInputError(
+        name === "spine_close"
+          ? "The root scope cannot be closed. Continue in root, or call spine_open first and close that branch instead."
+          : "The root scope has no sibling to enter. Continue in root, or call spine_open to enter a child first.",
+      );
+    }
   }
 
   stageSpawn(
@@ -252,6 +317,8 @@ export class DeepSeekHarnessSamplingLifecycle {
       this.#inputTokens = undefined;
       this.#successfulStepPending = false;
       this.#executions.clear();
+      this.#toolOutcomes.clear();
+      this.#exclusiveStaged = false;
     });
   }
 
@@ -321,9 +388,13 @@ export class DeepSeekHarnessSamplingLifecycle {
     this.#inputTokens = undefined;
   }
 
-  #enqueue(operation: () => Promise<void>): void {
-    this.#tail = this.#tail.then(() => this.#guard(operation));
+  #enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.#tail.then(() => this.#guard(operation));
+    // Keep the serial tail's rejection so a fault latches every later boundary;
+    // the handler only prevents an unobserved rejection warning.
+    this.#tail = run.then(() => undefined);
     void this.#tail.catch(() => undefined);
+    return run;
   }
 
   async #serialize<T>(operation: () => Promise<T>): Promise<T> {
@@ -362,6 +433,7 @@ export class DeepSeekHarnessSamplingLifecycle {
   }
 
   #notifyContext(context: PublishedContext, phase: "preview" | "publish" | "commit"): void {
+    this.#activeDepth = Math.max(1, context.projection.cursor.length);
     try {
       this.#reporter?.context(context, phase);
     } catch {

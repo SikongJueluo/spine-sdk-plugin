@@ -14,6 +14,7 @@ import {
   preparePreStepDecision,
   recoverState,
 } from "../dist/deepseek-harness/extension.js";
+import { loadSpineContract } from "../dist/deepseek-harness/contract.js";
 import {
   buildDeepSeekHarnessReplayPlan,
   createDeepSeekHarnessSessionPort,
@@ -22,6 +23,7 @@ import {
   DeepSeekHarnessSurfacePublisher,
   DeepSeekHarnessSamplingLifecycle,
   MemoryDeepSeekHarnessLedger,
+  materializeDeepSeekHarnessContext,
   recoverDeepSeekHarnessSession,
 } from "../dist/deepseek-harness/index.js";
 
@@ -889,6 +891,161 @@ test("real tool success and failure commit the matching Spine execution", async 
   }
 });
 
+test("root close is an ordinary tool error, not a lifecycle fault", async () => {
+  const { ctx, store, session } = liveSession("root-close");
+  system(store, session);
+  session.append("user/message", user("u1", "hello"), { surfaceOp: "append" });
+  const ledger = new MemoryDeepSeekHarnessLedger();
+  const state = await recoverState(ctx, session, undefined, async () => ledger);
+  const contract = loadSpineContract();
+  const close = createTool(
+    ctx,
+    contract.tools.find((tool) => tool.name === "spine_close"),
+    "spawn",
+    async () => state,
+  );
+  await state.lifecycle.beginSampling();
+  // The model sees this rejection as the close call's own error result and may
+  // continue in root; the sampling itself stays healthy.
+  await assert.rejects(
+    close.execute({ memory: "done" }, { agent: { session }, callId: "call-close" }),
+    /root scope cannot be closed/i,
+  );
+  await assert.rejects(
+    state.lifecycle.beginToolExecution("call-next", "spine_next", { goal: "g", memory: "m" }),
+    /root scope has no sibling/i,
+  );
+  await state.lifecycle.finishNow("completed");
+  let commits = (await ledger.entries(session.id, session.header.createdAt))
+    .filter((entry) => entry.kind === "archive")
+    .map((entry) => entry.archive.record.record)
+    .filter((record) => record.schema === "spine.sampling.commit");
+  assert.equal(commits.at(-1).executions.length, 0);
+
+  // The durable tool/call event reuses that same rejected admission instead of
+  // staging a control operation behind the model's back.
+  await state.lifecycle.beginSampling();
+  observeEvent(state, {
+    type: "tool/call",
+    seq: 100,
+    time: 1,
+    data: {
+      turn: 1,
+      step: 1,
+      callId: "call-close",
+      name: "spine_close",
+      arguments: '{"memory":"done"}',
+    },
+  });
+  await state.lifecycle.drain();
+  await state.lifecycle.finishNow("completed");
+  commits = (await ledger.entries(session.id, session.header.createdAt))
+    .filter((entry) => entry.kind === "archive")
+    .map((entry) => entry.archive.record.record)
+    .filter((record) => record.schema === "spine.sampling.commit");
+  assert.equal(commits.at(-1).executions.length, 0);
+  assert.equal(state.lifecycle.fault, null);
+
+  state.lifecycle.dispose();
+  state.runtime.dispose();
+});
+
+test("one Spine transition per response and the committed cursor gate close/next", async () => {
+  const { ctx, store, session } = liveSession("transition-admission");
+  system(store, session);
+  session.append("user/message", user("u1", "hello"), { surfaceOp: "append" });
+  const ledger = new MemoryDeepSeekHarnessLedger();
+  let lastContext;
+  const state = await recoverState(ctx, session, undefined, async () => ledger, {
+    context: (context) => { lastContext = context; },
+    activity() {},
+    fault() {},
+  });
+
+  await state.lifecycle.beginSampling();
+  await state.lifecycle.beginToolExecution("open", "spine_open", { goal: "child" });
+  await assert.rejects(
+    state.lifecycle.beginToolExecution("open-close", "spine_close", { memory: "done" }),
+    /Only one Spine scope transition/,
+  );
+  observeEvent(state, {
+    type: "tool/call",
+    seq: 10,
+    time: 1,
+    data: { turn: 1, step: 1, callId: "open", name: "spine_open", arguments: '{"goal":"child"}' },
+  });
+  observeEvent(state, {
+    type: "tool/result",
+    seq: 11,
+    time: 2,
+    data: {
+      turn: 1,
+      step: 1,
+      message: toolResult("t-open", "open", "accepted"),
+    },
+  });
+  await state.lifecycle.finishNow("completed");
+  assert.match(
+    materializeDeepSeekHarnessContext(lastContext, state.bindings)
+      .map((message) => message.content[0]?.text ?? "").join("\n"),
+    /<spine_node id="1\.1" summary="child" status="opened">/,
+    "the committed plan exposes the active branch",
+  );
+
+  await state.lifecycle.beginSampling();
+  await state.lifecycle.beginToolExecution("close", "spine_close", { memory: "done" });
+  await assert.rejects(
+    state.lifecycle.beginToolExecution("close-open", "spine_open", { goal: "again" }),
+    /Only one Spine scope transition/,
+  );
+  observeEvent(state, {
+    type: "tool/call",
+    seq: 20,
+    time: 3,
+    data: { turn: 1, step: 2, callId: "close", name: "spine_close", arguments: '{"memory":"done"}' },
+  });
+  observeEvent(state, {
+    type: "tool/result",
+    seq: 21,
+    time: 4,
+    data: {
+      turn: 1,
+      step: 2,
+      message: toolResult("t-close", "close", "accepted"),
+    },
+  });
+  await state.lifecycle.finishNow("completed");
+  assert.deepEqual(lastContext.projection.cursor, [1], "close returned the cursor to root");
+  assert.match(
+    materializeDeepSeekHarnessContext(lastContext, state.bindings)
+      .map((message) => message.content[0]?.text ?? "").join("\n"),
+    /<spine_memory node_id="1\.1">\ndone\n<\/spine_memory>/,
+    "close publishes the model-authored memory",
+  );
+
+  const commits = (await ledger.entries(session.id, session.header.createdAt))
+    .filter((entry) => entry.kind === "archive")
+    .map((entry) => entry.archive.record.record)
+    .filter((record) => record.schema === "spine.sampling.commit");
+  assert.deepEqual(
+    commits.map((record) => record.executions.map((execution) => execution.operation.type)),
+    [["open"], ["close"]],
+    "the rejected second transition never reaches the commit",
+  );
+
+  await state.lifecycle.beginSampling();
+  await assert.rejects(
+    state.lifecycle.beginToolExecution("root-close", "spine_close", { memory: "done" }),
+    /root scope cannot be closed/i,
+    "closing the branch returned the cursor to root",
+  );
+  await state.lifecycle.finishNow("completed");
+  assert.equal(state.lifecycle.fault, null);
+
+  state.lifecycle.dispose();
+  state.runtime.dispose();
+});
+
 test("invalid spine_spawn arguments are rejected without faulting the session", async () => {
   const { ctx, store, session } = liveSession("spawn-undercount");
   system(store, session);
@@ -945,10 +1102,14 @@ test("invalid spine_spawn arguments are rejected without faulting the session", 
 
 test("the spine_spawn tool contract and guided rejection", async () => {
   const ctx = new Context();
-  const tool = createTool(ctx, "spine_spawn", "spawn", async () => {
+  const contract = loadSpineContract();
+  const spawn = contract.tools.find((tool) => tool.name === "spine_spawn");
+  assert.ok(spawn);
+  assert.match(spawn.description, /two or more concurrent peer branches/);
+  assert.match(spawn.parameters.properties.tasks.description, /At least 2 items/);
+  const tool = createTool(ctx, spawn, "spawn", async () => {
     throw new Error("ensureState must not run for rejected arguments");
   });
-  assert.match(String(tool.description), /AT LEAST TWO/);
   await assert.rejects(
     tool.execute({ tasks: [{ summary: "only", prompt: "do it" }] }, { agent: {}, callId: "c1" }),
     (error) =>
@@ -1155,6 +1316,7 @@ test("the loaded extension invalidates a failed pre-admission before the next st
     sessions: store,
     storageDomain: facility,
     tools: { register(tool) { tools.push(tool); return () => {}; } },
+    systemPrompt: { getSectionOrder: () => 500, section: () => () => {} },
     subagents: {},
     get() { return undefined; },
     on(name, listener) { listeners.set(name, listener); return () => {}; },

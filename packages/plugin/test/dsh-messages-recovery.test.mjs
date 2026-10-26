@@ -98,12 +98,28 @@ test("DSH message transport preserves native tool messages and canonical project
             },
           },
         },
+        {
+          type: "projection",
+          projection_id: { thread: "s", epoch: 0, ordinal: 2 },
+          item: {
+            SyntheticNode: {
+              node_id: [1, 1],
+              summary: "child & <work>",
+              status: "Live",
+            },
+          },
+        },
       ],
     },
   }, bindings);
   assert.equal(messages[0].content[0].text, "[U3]\nhello");
   assert.deepEqual(messages[1].source, { kind: "spine-context", form: "recall" });
   assert.match(messages[1].content[0].text, /<spine_memory node_id="1">/);
+  assert.match(
+    messages[2].content[0].text,
+    /<spine_node id="1\.1" summary="child &amp; &lt;work&gt;" status="live">/,
+    "the active branch descriptor is the model-visible scope state",
+  );
   assert.equal(user.content[0].text, "hello");
 });
 

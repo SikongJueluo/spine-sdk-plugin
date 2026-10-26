@@ -16,6 +16,7 @@ import {
 import {
   type DeepSeekHarnessMessage,
 } from "./dsh.js";
+import { loadSpineContract, type SpineToolContract } from "./contract.js";
 import {
   createDeepSeekHarnessSessionPort,
   createDeepSeekHarnessSpawnStagingStore,
@@ -59,7 +60,15 @@ import {
 } from "./recovery.js";
 
 export const name = "spine";
-export const inject = ["agents", "llm", "sessions", "subagents", "tools", "storageDomain"];
+export const inject = [
+  "agents",
+  "llm",
+  "sessions",
+  "subagents",
+  "tools",
+  "storageDomain",
+  "systemPrompt",
+];
 
 export interface Config {
   enabled?: boolean;
@@ -129,6 +138,7 @@ export function apply(ctx: Context, config: Config = {}): void {
   assertExclusiveCompaction(ctx, "load");
   const spawnProvider = nonEmpty(config.spawnProvider ?? "spawn", "spawnProvider");
   const configToml = config.configToml;
+  const contract = loadSpineContract(configToml);
   const states = new WeakMap<Session, Promise<SessionState>>();
   const resolvedStates = new WeakMap<Session, SessionState>();
   const bySessionId = new Map<string, Promise<SessionState>>();
@@ -318,8 +328,24 @@ export function apply(ctx: Context, config: Config = {}): void {
     ]);
   }, "spine: dispose DSH session runtimes");
 
-  for (const toolName of SPINE_TOOL_NAMES) {
-    ctx.tools.register(createTool(ctx, toolName, spawnProvider, ensureState) as unknown as ToolDefinition);
+  // Core's workflow policy is model-facing only where the whole Spine tool
+  // surface is visible in the assembling scope. A scoped section therefore
+  // disappears with a restriction, a disabled preset, or plugin unload.
+  ctx.systemPrompt.section({
+    name: "tool:spine",
+    order: ctx.systemPrompt.getSectionOrder("PLAN_POLICY") + 1,
+    // Core's policy is literal model text, not a prompt-variable template.
+    interpolate: false,
+    text: ({ scope }) => SPINE_TOOL_NAMES.every((name) =>
+      ctx.tools.get(name, scope) !== undefined)
+      ? contract.rules
+      : "",
+  });
+
+  for (const tool of contract.tools) {
+    ctx.tools.register(
+      createTool(ctx, tool, spawnProvider, ensureState) as unknown as ToolDefinition,
+    );
   }
 }
 
@@ -371,12 +397,16 @@ export async function recoverState(
     if (runtime === undefined || port === undefined) {
       throw new Error("DSH Spine recovery did not construct its runtime port");
     }
+    // The recovered cursor is the authority for legal transitions before the
+    // first pre-step preview runs.
+    const recoveredContext = await recovered.adapter.preview();
     const lifecycle = new DeepSeekHarnessSamplingLifecycle(
       recovered.adapter,
       recovered.bindings,
       recovered.source,
       {
         replayCut,
+        activeDepth: recoveredContext.projection.cursor.length,
         isPublishedSeq: port.isPublishedSeq,
         ...(reporter === undefined ? {} : { reporter }),
       },
@@ -602,35 +632,16 @@ export function observeEvent(state: SessionState, event: SessionEvent): void {
 
 export function createTool(
   ctx: Context,
-  toolName: SpineToolName,
+  tool: SpineToolContract,
   spawnProvider: string,
   ensureState: (agent: DshAgent) => Promise<SessionState>,
 ): ToolDefinition {
+  const toolName = tool.name;
   const isSpawn = toolName === "spine_spawn";
   return {
     name: toolName,
-    description: toolDescription(toolName),
-    parameters: isSpawn
-      ? {
-          type: "object",
-          additionalProperties: false,
-          required: ["tasks"],
-          properties: {
-            tasks: {
-              type: "array",
-              items: {
-                type: "object",
-                additionalProperties: false,
-                required: ["summary", "prompt"],
-                properties: {
-                  summary: { type: "string" },
-                  prompt: { type: "string" },
-                },
-              },
-            },
-          },
-        }
-      : toolParameters(toolName),
+    description: tool.description,
+    parameters: tool.parameters,
     output: {
       schema: {
         type: "object",
@@ -648,10 +659,19 @@ export function createTool(
           toolName as Exclude<SpineToolName, "spine_spawn">,
           args as Record<string, unknown>,
         );
+        const state = await ensureState(agent);
+        // Surface an illegal state transition as this call's error instead of
+        // accepting it and faulting when the sampling commits.
+        await state.lifecycle.beginToolExecution(
+          exec.callId,
+          toolName as Exclude<SpineToolName, "spine_spawn">,
+          args,
+        );
         return { status: "accepted" };
       }
       const tasks = decodeSpawnTasksOrExplain(args);
       const state = await ensureState(agent);
+      await state.lifecycle.beginToolExecution(exec.callId, "spine_spawn", args);
       const results = await executeSpawnBatch({
         batchId: exec.callId,
         tasks,
@@ -696,29 +716,6 @@ async function executeChild(
     };
   } finally {
     await run.dispose();
-  }
-}
-
-function toolParameters(name: Exclude<SpineToolName, "spine_spawn">): Record<string, unknown> {
-  const properties: Record<string, unknown> = {};
-  const required: string[] = [];
-  if (name === "spine_open" || name === "spine_next") {
-    properties.goal = { type: "string" };
-    required.push("goal");
-  }
-  if (name === "spine_close" || name === "spine_next") {
-    properties.memory = { type: "string" };
-    required.push("memory");
-  }
-  return { type: "object", additionalProperties: false, required, properties };
-}
-
-function toolDescription(name: SpineToolName): string {
-  switch (name) {
-    case "spine_open": return "Open one child Spine scope with a concise summary.";
-    case "spine_close": return "Close the active Spine scope with model-authored memory.";
-    case "spine_next": return "Close the active Spine scope and open its next sibling.";
-    case "spine_spawn": return "Fan out AT LEAST TWO independent child tasks (tasks.length must be >= 2; single-subtask work is not a fan-out) and return ordered terminal memories.";
   }
 }
 
