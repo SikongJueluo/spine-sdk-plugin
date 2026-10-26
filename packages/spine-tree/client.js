@@ -114,9 +114,9 @@ window.__ModuleLoader__.load({
       "tree.unavailable": "Spine 树不可用",
       "tree.empty": "此会话还没有 Spine 节点。",
       "tree.emptyHint": "Spine 节点会在第一次采样提交后出现。",
-      "unavailable.title": "Spine 宿主插件未启用",
-      "unavailable.body": "当前 profile 没有加载 Spine 宿主插件，因此没有可读取的 Spine 数据。查看器不会自行伪造数据。",
-      "unavailable.hint": "在 profile 中挂载 packages/plugin 的 deepseek-harness 扩展后，本页会显示实时树与请求证据。",
+      "unavailable.title": "Spine 未启用",
+      "unavailable.body": "当前会话所属的 preset 没有提供 Spine 检查数据，因此没有可读取的树或请求证据。查看器不会自行伪造数据。",
+      "unavailable.hint": "在 preset 中启用 packages/plugin 的 deepseek-harness 扩展（inspect 未关闭），并用该 preset 新建会话；本页随后会显示实时树与请求证据。",
       "error.title": "无法读取 Spine 数据",
       "error.network": "与宿主的数据通道中断，正在重试。",
       "detail.overview": "概览",
@@ -230,9 +230,9 @@ window.__ModuleLoader__.load({
       "tree.unavailable": "Spine tree unavailable",
       "tree.empty": "This Session has no Spine nodes yet.",
       "tree.emptyHint": "Nodes appear after the first committed sampling.",
-      "unavailable.title": "Spine host plugin is not enabled",
-      "unavailable.body": "This profile does not load the Spine host plugin, so there is no Spine data to read. The viewer does not invent one.",
-      "unavailable.hint": "Mount the deepseek-harness extension from packages/plugin in this profile; this page then shows the live tree and request evidence.",
+      "unavailable.title": "Spine is not enabled",
+      "unavailable.body": "The preset this Session uses does not provide Spine inspection data, so there is no tree or request evidence to read. The viewer does not invent one.",
+      "unavailable.hint": "Enable the deepseek-harness extension from packages/plugin in the preset (with inspect not disabled), then open a Session of that preset; this page then shows the live tree and request evidence.",
       "error.title": "Could not read Spine data",
       "error.network": "The host data channel is down; retrying.",
       "detail.overview": "Overview",
@@ -377,11 +377,13 @@ window.__ModuleLoader__.load({
     function useSpineFeed(sessionId) {
       const [state, setState] = useState({ phase: "loading", data: null, error: null, lastOk: 0, failures: 0 });
       const revision = useRef(null);
+      const source = useRef(null);
       useEffect(() => {
         let stopped = false;
         let timer = 0;
         let controller = null;
         revision.current = null;
+        source.current = null;
         setState({ phase: "loading", data: null, error: null, lastOk: 0, failures: 0 });
         if (sessionId === null) return undefined;
         const schedule = (milliseconds) => {
@@ -393,7 +395,14 @@ window.__ModuleLoader__.load({
           try {
             const params = new URLSearchParams();
             params.set("sessionId", sessionId);
-            if (revision.current !== null) params.set("since", String(revision.current));
+            // The revision counter is local to one inspection source. Echo the
+            // source generation too; the Host only honors `since` when both
+            // name the same source, so a replacement revision always yields a
+            // fresh baseline even when its counter starts at the same number.
+            if (source.current !== null) {
+              params.set("source", source.current);
+              if (revision.current !== null) params.set("since", String(revision.current));
+            }
             const response = await fetch(`${VIEW_ROUTE}?${params.toString()}`, {
               headers: { accept: "application/json" },
               signal: controller === null ? undefined : controller.signal,
@@ -402,6 +411,9 @@ window.__ModuleLoader__.load({
             const payload = await response.json();
             if (stopped) return;
             if (payload !== null && typeof payload === "object" && payload.unchanged === true) {
+              if (typeof payload.source === "string" && payload.source.length > 0) {
+                source.current = payload.source;
+              }
               setState((previous) => ({
                 ...previous,
                 phase: previous.data === null ? "loading" : "ready",
@@ -411,6 +423,9 @@ window.__ModuleLoader__.load({
               }));
             } else if (payload !== null && typeof payload === "object" && typeof payload.revision === "number") {
               revision.current = payload.revision;
+              source.current = typeof payload.source === "string" && payload.source.length > 0
+                ? payload.source
+                : null;
               setState({ phase: "ready", data: payload, error: null, lastOk: Date.now(), failures: 0 });
             } else {
               throw new Error("unexpected response");
@@ -547,7 +562,8 @@ window.__ModuleLoader__.load({
       const hostMessage = view === null || view === undefined || view.host === undefined || view.host === null
         ? null
         : view.host.message ?? null;
-      const notEnabled = view !== null && view !== undefined && !hostAvailable && hostReason === "spine-host-inactive";
+      const notEnabled = view !== null && view !== undefined && !hostAvailable &&
+        (hostReason === "spine-host-inactive" || hostReason === "spine-preset-inactive");
 
       const node = useMemo(() => {
         if (tree === null || tree === undefined || selectedNode === null) return null;

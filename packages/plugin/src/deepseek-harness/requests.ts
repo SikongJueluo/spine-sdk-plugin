@@ -268,6 +268,16 @@ export interface DeepSeekHarnessRequestStore {
   summaries(sessionId: string): SpineRequestSummary[];
   detail(sessionId: string, requestId: string): CapturedRequestRecord | null;
   count(sessionId: string): number;
+  /**
+   * Raise the per-Session retention. A process-shared store takes the largest
+   * value any mounted Spine instance asked for; it never shrinks.
+   */
+  setRetention(retention: number): void;
+  /**
+   * Per-Session write generation. Every completed append moves it, including
+   * appends made through another inspection instance that shares this store.
+   */
+  dataGeneration(sessionId: string): number;
   close(): Promise<void>;
 }
 
@@ -338,8 +348,9 @@ export async function openDeepSeekHarnessRequestStore(
 export class DomainDeepSeekHarnessRequestStore implements DeepSeekHarnessRequestStore {
   readonly #domain: DeepSeekHarnessRequestDomain;
   readonly #table: DeepSeekHarnessRequestTable;
-  readonly #retention: number;
+  #retention: number;
   readonly #bySession = new Map<string, Map<string, { record: CapturedRequestRecord; key: string }>>();
+  readonly #generations = new Map<string, number>();
   #closed = false;
 
   constructor(domain: DeepSeekHarnessRequestDomain, retention: number) {
@@ -361,6 +372,10 @@ export class DomainDeepSeekHarnessRequestStore implements DeepSeekHarnessRequest
     await this.#table.put(key, record);
     session.set(record.requestId, { record, key });
     await this.#prune(record.sessionId, session);
+    this.#generations.set(
+      record.sessionId,
+      (this.#generations.get(record.sessionId) ?? 0) + 1,
+    );
   }
 
   summaries(sessionId: string): SpineRequestSummary[] {
@@ -380,6 +395,14 @@ export class DomainDeepSeekHarnessRequestStore implements DeepSeekHarnessRequest
   count(sessionId: string): number {
     this.#assertOpen();
     return this.#session(sessionId).size;
+  }
+
+  setRetention(retention: number): void {
+    this.#retention = Math.max(this.#retention, Math.max(1, Math.trunc(retention)));
+  }
+
+  dataGeneration(sessionId: string): number {
+    return this.#generations.get(sessionId) ?? 0;
   }
 
   async close(): Promise<void> {
@@ -417,7 +440,8 @@ export class DomainDeepSeekHarnessRequestStore implements DeepSeekHarnessRequest
 /** In-memory store for tests and minimal embeddings. */
 export class MemoryDeepSeekHarnessRequestStore implements DeepSeekHarnessRequestStore {
   readonly #bySession = new Map<string, CapturedRequestRecord[]>();
-  readonly #retention: number;
+  readonly #generations = new Map<string, number>();
+  #retention: number;
   #closed = false;
 
   constructor(retention = DEFAULT_REQUEST_RETENTION) {
@@ -429,6 +453,10 @@ export class MemoryDeepSeekHarnessRequestStore implements DeepSeekHarnessRequest
     if (session.some((entry) => entry.requestId === record.requestId)) return;
     session.push(record);
     if (session.length > this.#retention) session.splice(0, session.length - this.#retention);
+    this.#generations.set(
+      record.sessionId,
+      (this.#generations.get(record.sessionId) ?? 0) + 1,
+    );
   }
 
   summaries(sessionId: string): SpineRequestSummary[] {
@@ -441,6 +469,14 @@ export class MemoryDeepSeekHarnessRequestStore implements DeepSeekHarnessRequest
 
   count(sessionId: string): number {
     return this.#records(sessionId).length;
+  }
+
+  setRetention(retention: number): void {
+    this.#retention = Math.max(this.#retention, Math.max(1, Math.trunc(retention)));
+  }
+
+  dataGeneration(sessionId: string): number {
+    return this.#generations.get(sessionId) ?? 0;
   }
 
   async close(): Promise<void> {

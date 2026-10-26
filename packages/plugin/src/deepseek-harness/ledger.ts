@@ -66,6 +66,11 @@ export interface DeepSeekHarnessLedger {
     batchId: string,
     result: SpawnResult,
   ): Promise<void>;
+  /**
+   * Per-Session write generation. Every completed append moves it, including
+   * appends made through another inspection instance that shares this ledger.
+   */
+  dataGeneration(sessionId: string): number;
   close(): Promise<void>;
 }
 
@@ -132,6 +137,8 @@ export class DomainDeepSeekHarnessLedger implements DeepSeekHarnessLedger {
   }>();
   /** One write chain per session: ordinal allocation, dedupe, put, and memory commit. */
   readonly #tails = new Map<string, Promise<void>>();
+  /** Completed-write counters visible to every reader of this ledger handle. */
+  readonly #generations = new Map<string, number>();
   #closed = false;
 
   constructor(domain: DeepSeekHarnessLedgerDomain) {
@@ -166,6 +173,10 @@ export class DomainDeepSeekHarnessLedger implements DeepSeekHarnessLedger {
     const state = this.#sessions.get(sessionId);
     if (state === undefined) return undefined;
     return { sessionCreatedAt: state.createdAt, entries: [...state.entries] };
+  }
+
+  dataGeneration(sessionId: string): number {
+    return this.#generations.get(sessionId) ?? 0;
   }
 
   async appendArchive(
@@ -234,6 +245,7 @@ export class DomainDeepSeekHarnessLedger implements DeepSeekHarnessLedger {
     await this.#table.put(ledgerKey(sessionId, entry.ordinal), entry);
     state.entries.push(entry);
     state.nextOrdinal += 1;
+    this.#generations.set(sessionId, (this.#generations.get(sessionId) ?? 0) + 1);
   }
 
   async #serialize<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
@@ -274,6 +286,7 @@ export class MemoryDeepSeekHarnessLedger implements DeepSeekHarnessLedger {
     createdAt: number;
     entries: DeepSeekHarnessLedgerEntry[];
   }>();
+  readonly #generations = new Map<string, number>();
   #closed = false;
 
   async entries(
@@ -292,6 +305,10 @@ export class MemoryDeepSeekHarnessLedger implements DeepSeekHarnessLedger {
     const state = this.#sessions.get(sessionId);
     if (state === undefined) return undefined;
     return { sessionCreatedAt: state.createdAt, entries: [...state.entries] };
+  }
+
+  dataGeneration(sessionId: string): number {
+    return this.#generations.get(sessionId) ?? 0;
   }
 
   async appendArchive(
@@ -351,6 +368,7 @@ export class MemoryDeepSeekHarnessLedger implements DeepSeekHarnessLedger {
       anchorSeq,
       ...body,
     } as DeepSeekHarnessLedgerEntry);
+    this.#generations.set(sessionId, (this.#generations.get(sessionId) ?? 0) + 1);
   }
 
   #session(sessionId: string, sessionCreatedAt: number) {

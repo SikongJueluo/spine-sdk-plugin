@@ -102,6 +102,7 @@ test("loadable DSH extension registers exactly the four canonical tools", () => 
     get() { return undefined; },
     on(event, listener) { listeners.push([event, listener]); return () => {}; },
     effect() {},
+    inject() {},
   };
   apply(ctx, {});
   assert.equal(name, "spine");

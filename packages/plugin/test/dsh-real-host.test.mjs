@@ -1159,6 +1159,7 @@ test("the loaded extension invalidates a failed pre-admission before the next st
     get() { return undefined; },
     on(name, listener) { listeners.set(name, listener); return () => {}; },
     effect() {},
+    inject() {},
   }, {});
   assert.equal(tools.length, 4);
   const preStep = listeners.get("agent/pre-step");

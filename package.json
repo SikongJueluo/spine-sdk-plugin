@@ -17,6 +17,7 @@
     "test:wasm-golden": "node scripts/verify-wasm-golden.mjs"
   },
   "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.4",
     "@types/node": "22.10.2",
     "typescript": "5.9.2"
   }

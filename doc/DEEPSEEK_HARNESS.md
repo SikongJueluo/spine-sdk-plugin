@@ -192,14 +192,30 @@ same session.
 ## Web inspection UI
 
 `packages/spine-tree` bundles the `Spine Tree` Conversation View and the two
-read-only routes it reads. It is additive: the Host half only registers
-`GET /api/spine.tree` and `GET /api/spine.request` and asks the extension for the
-provided `spineInspection` service, so the tab renders an explicit
-"host not enabled" state when the extension is absent.
+read-only routes it reads. Its Host half owns the `spineInspectionHost` broker,
+registers `GET /api/spine.tree` and `GET /api/spine.request`, and renders an
+explicit "Spine is not enabled" state when no preset contributes an inspection.
 
-The extension provides `spineInspection` when its `inspect` config is not
-`false`, and captures frozen loop requests when `requestAudit` is not `false`.
+A preset-mounted Spine extension contributes to that broker when its `inspect`
+config is not `false`. The contribution is a method call on a Host service, not
+a root-realm `provide`: a preset plugin that publishes a service makes DSH
+reject the whole preset with `agent-preset/invalid: Preset services require
+isolate realms`. The extension still works when the Web companion is absent;
+the optional nested injection simply never activates. It captures frozen loop
+requests when `requestAudit` is not `false`.
+
+Tree responses carry a per-registration `source` generation beside the local
+numeric `revision`. The client sends both; the Host honors `since` only for the
+same source, so a replacement preset revision returns a fresh baseline even
+when its counter starts at the same value. The ledger and evidence stores also
+expose a per-Session write generation: a view invalidates its cold replay and
+snapshot when another retained revision has persisted evidence or ledger
+entries, and advances its own revision.
+
 Captured request evidence lives in the `spine_dsh_audit` domain (retention:
 `requestRetention`, default 100 per session) and never enters the session log or
-`spine_dsh_ledger`. See [SPINE_TREE_UI.md](SPINE_TREE_UI.md) for the read-only
-guarantee, the audited layer, and the known limits.
+`spine_dsh_ledger`. Both durable domains are shared by every live Spine
+instance that opens them through the same storage facility, so two presets or a
+retired revision do not race the single-open rule; the last unload closes them.
+See [SPINE_TREE_UI.md](SPINE_TREE_UI.md) for routing between preset revisions,
+the read-only guarantee, the audited layer, and the known limits.

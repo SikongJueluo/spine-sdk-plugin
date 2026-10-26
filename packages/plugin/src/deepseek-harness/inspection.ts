@@ -36,7 +36,34 @@ import {
   type SpineTreeView,
 } from "./view.js";
 
-export const SPINE_INSPECTION_SERVICE = "spineInspection" as const;
+/**
+ * Host service a mounted preset contributes its inspection to.
+ *
+ * A preset plugin cannot publish a service into the root realm: DSH rejects
+ * the mount as a preset service leak. The Host Web companion owns this
+ * registry instead, and the extension registers one contribution per preset
+ * revision through an optional nested injection.
+ */
+export const SPINE_INSPECTION_HOST_SERVICE = "spineInspectionHost" as const;
+
+/** One preset revision's read-only inspection, as the Host broker sees it. */
+export interface SpineInspectionContribution {
+  /** Stable per extension instance, for diagnostics only. */
+  readonly id: string;
+  /** Preset id this revision serves, learned from a live Session when unset. */
+  presetId(): string | undefined;
+  /** Whether this revision currently holds the live Session. */
+  hasLive(sessionId: string): boolean;
+  /** Whether this revision can prove it owns a historical Session. */
+  owns(sessionId: string): Promise<boolean>;
+  view(sessionId: string, request?: SpineViewRequest): Promise<SpineViewResponse>;
+  request(sessionId: string, requestId: string): Promise<SpineRequestDetailResponse>;
+}
+
+/** Host-side registry the extension contributes to. */
+export interface SpineInspectionHost {
+  register(contribution: SpineInspectionContribution): () => void;
+}
 
 /**
  * Structural test for a request assembled by `dsh-agent-loop`.
@@ -103,6 +130,8 @@ export interface SpineInspectionOptions {
     createdAt: number;
   } | null>;
   runtimeFactory: (thread: string) => DisposableSpineRuntime;
+  /** Preset id this revision serves; overridden by a live Session header. */
+  presetId?: string | undefined;
   now?: () => number;
 }
 
@@ -145,12 +174,51 @@ export class DeepSeekHarnessInspection implements SpineInspectionService {
   readonly #snapshots = new Map<string, { revision: number; view: SpineSessionView }>();
   readonly #building = new Map<string, { revision: number; promise: Promise<SpineSessionView> }>();
   readonly #requestErrors = new Map<string, string>();
+  /** Last shared-store write generation observed per Session. */
+  readonly #seenData = new Map<string, string>();
   #requestStore: Promise<DeepSeekHarnessRequestStore> | null = null;
   #requestStoreError: string | null = null;
+  #learnedPresetId: string | undefined;
   #closed = false;
 
   constructor(options: SpineInspectionOptions) {
     this.#options = options;
+    this.#learnedPresetId = options.presetId;
+  }
+
+  /**
+   * Preset id this revision serves. A configured id is exact; otherwise the
+   * first live Session header supplies it, which is the durable identity DSH
+   * records when the Agent joins a preset.
+   */
+  presetId(): string | undefined {
+    return this.#learnedPresetId;
+  }
+
+  /** Whether this revision currently holds the Session live. */
+  hasLive(sessionId: string): boolean {
+    return this.#live.has(sessionId);
+  }
+
+  /**
+   * Whether this revision can prove it owns a historical Session: its live
+   * map, its ledger, or its captured request evidence names the Session.
+   */
+  async owns(sessionId: string): Promise<boolean> {
+    if (this.#live.has(sessionId)) return true;
+    try {
+      const ledger = await this.#options.ledger();
+      if (await ledger.findSession(sessionId) !== undefined) return true;
+    } catch {
+      // A store that cannot be read proves nothing; selection falls through.
+    }
+    if (this.#options.requests === undefined) return false;
+    try {
+      const store = await this.#requestStorage();
+      return store.count(sessionId) > 0;
+    } catch {
+      return false;
+    }
   }
 
   /** Start opening request evidence in the background; failures surface in the view. */
@@ -163,6 +231,12 @@ export class DeepSeekHarnessInspection implements SpineInspectionService {
     const sessionId = String(session.id);
     const existing = this.#live.get(sessionId);
     if (existing !== undefined && existing.session === session) return;
+    const preset = session.header.agentPreset;
+    if (typeof preset === "string" && preset.length > 0) {
+      // A live Session header is the durable identity of the Agent that joined
+      // this preset; it outranks a stale configured seed.
+      this.#learnedPresetId = preset;
+    }
     this.#live.set(sessionId, {
       sessionId,
       session,
@@ -296,7 +370,12 @@ export class DeepSeekHarnessInspection implements SpineInspectionService {
     // Revision moves only once the record is readable from the store; bumping
     // earlier would cache a view whose request list cannot contain it yet and
     // the client's `since` poll would then never see the persisted evidence.
-    void this.#persist(record).then(() => {
+    void this.#persist(record).then(async () => {
+      if (this.#closed) return;
+      // Record our own write as seen before bumping: the next view must rebuild
+      // because #bump invalidated the snapshot, not because of a second
+      // generation change.
+      await this.#rememberSharedData(live.sessionId);
       if (!this.#closed) this.#bump(live.sessionId);
     }).catch((error: unknown) => {
       this.#requestErrors.set(live.sessionId, `Request evidence could not be stored: ${messageOf(error)}`);
@@ -307,10 +386,14 @@ export class DeepSeekHarnessInspection implements SpineInspectionService {
 
   async view(sessionId: string, request: SpineViewRequest = {}): Promise<SpineViewResponse> {
     this.#assertOpen();
+    // Another retained revision may have written the shared ledger or evidence
+    // store while this instance held a cold snapshot. Its revision counter did
+    // not move; the shared data generation did.
+    const dataChanged = await this.#sharedDataChanged(sessionId);
     const live = this.#live.get(sessionId);
     const ready = this.#isReady(sessionId, live);
     let revision = this.#revisions.get(sessionId);
-    if (revision === undefined || !ready) {
+    if (revision === undefined || dataChanged || !ready) {
       revision = this.#bump(sessionId);
     }
     if (request.since !== undefined && request.since === revision) {
@@ -360,9 +443,9 @@ export class DeepSeekHarnessInspection implements SpineInspectionService {
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
-    const store = this.#requestStore;
-    this.#requestStore = null;
-    if (store !== null) await store.then((open) => open.close()).catch(() => undefined);
+    // The request store is leased from the process-shared audit domain and is
+    // closed by the extension's lease release, not by one inspection instance:
+    // a retired preset revision may still be reading the same handle.
   }
 
   async #build(sessionId: string, live: LiveSession | undefined, revision: number): Promise<SpineSessionView> {
@@ -520,6 +603,60 @@ export class DeepSeekHarnessInspection implements SpineInspectionService {
     if (cold === undefined) return false;
     if (live === undefined) return true;
     return cold.key === `live:${live.session.seq}`;
+  }
+
+  /**
+   * Composite write generation of both shared stores for one Session.
+   *
+   * The ledger and evidence store are shared across live preset revisions, but
+   * a write through another revision does not bump this instance's local
+   * revision. Every view compares this value; a change invalidates the cold
+   * replay cache and the view snapshot.
+   */
+  async #dataGeneration(sessionId: string): Promise<string> {
+    let ledger = 0;
+    try {
+      const store = await this.#options.ledger();
+      if (typeof store.dataGeneration === "function") ledger = store.dataGeneration(sessionId);
+    } catch {
+      // An unreadable store contributes no generation; the view reports it.
+    }
+    let requests = 0;
+    if (this.#options.requests !== undefined) {
+      try {
+        const store = await this.#requestStorage();
+        if (typeof store.dataGeneration === "function") requests = store.dataGeneration(sessionId);
+      } catch {
+        // Same: the evidence state is reported by the view.
+      }
+    }
+    return `${ledger}:${requests}`;
+  }
+
+  async #sharedDataChanged(sessionId: string): Promise<boolean> {
+    let generation: string;
+    try {
+      generation = await this.#dataGeneration(sessionId);
+    } catch {
+      return false;
+    }
+    const seen = this.#seenData.get(sessionId);
+    if (seen === undefined) {
+      this.#seenData.set(sessionId, generation);
+      return false;
+    }
+    if (seen === generation) return false;
+    this.#seenData.set(sessionId, generation);
+    this.#cold.delete(sessionId);
+    return true;
+  }
+
+  async #rememberSharedData(sessionId: string): Promise<void> {
+    try {
+      this.#seenData.set(sessionId, await this.#dataGeneration(sessionId));
+    } catch {
+      // A later view will observe and invalidate on its own.
+    }
   }
 
   #bump(sessionId: string): number {

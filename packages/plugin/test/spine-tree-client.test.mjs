@@ -112,36 +112,59 @@ test("the client bundle registers one lazy factory and one Conversation View", (
   assert.equal(typeof registration[2], "function", "the view must register a component");
 });
 
-test("the host bundle registers two read-only routes and removes them on unload", () => {
+test("the host bundle provides the inspection broker and registers two read-only routes", async () => {
+  const host = await import("../../spine-tree/index.js");
+  let provided;
+  let injectedDeps;
   let registered = 0;
   let disposed = 0;
+  const disposers = [];
   const ctx = {
     get: () => undefined,
     effect(callback) {
-      this.cleanup = callback();
-      this.cleanup();
+      const dispose = callback();
+      if (typeof dispose === "function") disposers.push(dispose);
       return () => {};
     },
-    connection: {
-      fetch: {
-        register(route) {
-          registered += 1;
-          assert.deepEqual(route.methods, ["GET"]);
-          assert.equal(route.requestBody, "buffered");
-          assert.match(route.path, /^\/api\/spine\./);
-          return () => {
-            disposed += 1;
-            return Promise.resolve();
-          };
+    provide(name, value) {
+      provided = { name, value };
+      return () => {};
+    },
+    inject(deps, callback) {
+      injectedDeps = deps;
+      callback({
+        get(name) {
+          return name === "spineInspectionHost" ? provided?.value : undefined;
         },
-      },
+        effect(callback2) {
+          const dispose = callback2();
+          if (typeof dispose === "function") disposers.push(dispose);
+          return () => {};
+        },
+        connection: {
+          fetch: {
+            register(route) {
+              registered += 1;
+              assert.deepEqual(route.methods, ["GET"]);
+              assert.equal(route.requestBody, "buffered");
+              assert.match(route.path, /^\/api\/spine\./);
+              return () => {
+                disposed += 1;
+                return Promise.resolve();
+              };
+            },
+          },
+        },
+      });
     },
   };
-  return import("../../spine-tree/index.js").then(async (host) => {
-    assert.deepEqual([...host.inject], ["connection"]);
-    host.apply(ctx);
-    assert.equal(registered, 2);
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    assert.equal(disposed, 2);
-  });
+  host.apply(ctx);
+  assert.equal(host.inject, undefined, "the Web companion must not wait for a connection");
+  assert.equal(provided.name, "spineInspectionHost");
+  assert.equal(provided.value.schema, "spine.dsh.inspection-host.v1");
+  assert.deepEqual(injectedDeps, ["connection"]);
+  assert.equal(typeof provided.value.select, "function");
+  assert.equal(registered, 2);
+  for (const dispose of disposers) dispose();
+  assert.equal(disposed, 2);
 });

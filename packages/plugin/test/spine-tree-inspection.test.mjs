@@ -681,10 +681,19 @@ test("the inspection service serves revisions, evidence and details without touc
   await inspection.close();
 });
 
-test("the extension provides the inspection service over a cold Session", async () => {
+test("the extension contributes its inspection to the Host broker over a cold Session", async () => {
   const listeners = new Map();
   const disposers = [];
+  const contributions = new Set();
+  let closedDomains = 0;
   let provided;
+  const broker = {
+    schema: "spine.dsh.inspection-host.v1",
+    register(contribution) {
+      contributions.add(contribution);
+      return () => contributions.delete(contribution);
+    },
+  };
   const ctx = {
     sessions: {},
     subagents: {},
@@ -696,13 +705,13 @@ test("the extension provides the inspection service over a cold Session", async 
           put: async () => {},
           delete: async () => false,
         }),
-        close: async () => {},
+        close: async () => { closedDomains += 1; },
       }),
     },
     get(name) {
       if (name === "sessionController") {
         return {
-          inspect: async () => ({ meta: { createdAt: 5 }, events: [] }),
+          inspect: async () => ({ meta: { createdAt: 5, agentPreset: "personal" }, events: [] }),
         };
       }
       return undefined;
@@ -715,29 +724,74 @@ test("the extension provides the inspection service over a cold Session", async 
       const dispose = callback();
       if (typeof dispose === "function") disposers.push(dispose);
     },
-    provide(name, value) {
-      provided = { name, value };
-      return () => {};
+    provide() {
+      throw new Error("a preset plugin must not provide a root-realm service");
+    },
+    inject(deps, callback) {
+      assert.deepEqual(deps, ["spineInspectionHost"]);
+      callback({
+        get(name) {
+          return name === "spineInspectionHost" ? broker : undefined;
+        },
+        effect(callback2) {
+          const dispose = callback2();
+          if (typeof dispose === "function") disposers.push(dispose);
+        },
+      });
     },
   };
-  apply(ctx, {});
-  assert.equal(provided.name, "spineInspection");
-  assert.equal(provided.value.schema, "spine.dsh.inspect.v1");
+  apply(ctx, { presetId: "personal" });
+  assert.equal(provided, undefined);
+  assert.equal(contributions.size, 1, "one contribution reaches the Host broker");
+  const contribution = [...contributions][0];
+  assert.match(contribution.id, /^spine-inspection-/);
+  assert.equal(contribution.presetId(), "personal");
   assert.ok(listeners.has("llm/stream"));
   assert.ok(listeners.has("agent/pre-step"));
 
-  const view = await provided.value.view("cold-session");
+  const view = await contribution.view("cold-session");
   assert.equal(view.revision, 1);
   assert.equal(view.host.available, true);
   assert.equal(view.spine.state, "unavailable");
   assert.match(view.spine.note, /no Spine sampling archive/);
-  const unchanged = await provided.value.view("cold-session", { since: 1 });
+  const unchanged = await contribution.view("cold-session", { since: 1 });
   assert.deepEqual(unchanged, { revision: 1, unchanged: true });
 
-  const evidence = await provided.value.request("cold-session", "missing");
+  const evidence = await contribution.request("cold-session", "missing");
   assert.equal(evidence.ok, false);
   assert.match(evidence.reason, /No captured evidence/);
-  for (const dispose of disposers) dispose();
+
+  for (const dispose of disposers) await dispose();
+  assert.equal(contributions.size, 0, "unload removes the contribution");
+  assert.equal(closedDomains, 2, "unload closes both shared domains");
+});
+
+test("inspection learns its preset identity and can prove historical ownership", async () => {
+  const inspection = new DeepSeekHarnessInspection({
+    ledger: async () => ({
+      findSession: async (sessionId) => sessionId === "owned" ? {
+        sessionCreatedAt: 5,
+        entries: [],
+      } : undefined,
+      entries: async () => [],
+    }),
+    requests: undefined,
+    inspectSession: async () => null,
+    runtimeFactory: () => ({ client: {}, dispose() {} }),
+  });
+  assert.equal(inspection.presetId(), undefined);
+  assert.equal(await inspection.owns("owned"), true);
+  assert.equal(await inspection.owns("foreign"), false);
+
+  inspection.attach({
+    id: "session-1",
+    header: { createdAt: 5, agentPreset: "work" },
+    seq: 0,
+    snapshotEvents: () => [],
+  });
+  assert.equal(inspection.presetId(), "work");
+  assert.equal(inspection.hasLive("session-1"), true);
+  await inspection.close();
 });
 
 test("historical reconstruction reports the missing archive instead of a fake tree", async () => {
@@ -780,20 +834,53 @@ test("routes forward revision and request detail unchanged", async () => {
   const detail = { ok: true, reason: null, detail: { schema: "spine.dsh.request.v1" } };
   const routes = createSpineRoutes({
     service: () => ({
-      view: async (sessionId, options) => {
-        assert.equal(sessionId, "session-1");
-        assert.deepEqual(options, { since: 6 });
-        return view;
-      },
-      request: async (sessionId, requestId) => {
-        assert.equal(requestId, "req-1");
-        return detail;
-      },
+      select: async (sessionId) => ({
+        kind: "ok",
+        source: "source-1",
+        contribution: {
+          view: async (id, options) => {
+            assert.equal(id, "session-1");
+            assert.deepEqual(options, { since: 6 });
+            return view;
+          },
+          request: async (id, requestId) => {
+            assert.equal(id, "session-1");
+            assert.equal(requestId, "req-1");
+            return detail;
+          },
+        },
+      }),
     }),
   });
-  const tree = await routes.tree(new Request(`http://host${SPINE_TREE_PATH}?sessionId=session-1&since=6`));
-  assert.deepEqual(await tree.json(), view);
+  const tree = await routes.tree(new Request(
+    `http://host${SPINE_TREE_PATH}?sessionId=session-1&since=6&source=source-1`,
+  ));
+  assert.deepEqual(await tree.json(), { ...view, source: "source-1" });
   const item = await routes.request(new Request(`http://host${SPINE_REQUEST_PATH}?sessionId=session-1&id=req-1`));
   assert.deepEqual(await item.json(), detail);
   assert.equal(tree.headers.get("cache-control"), "no-store");
+});
+
+test("routes ignore a numeric cursor that does not name the selected source", async () => {
+  let options;
+  const routes = createSpineRoutes({
+    service: () => ({
+      select: async () => ({
+        kind: "ok",
+        source: "source-2",
+        contribution: {
+          view: async (_id, received) => {
+            options = received;
+            return { schema: "spine.dsh.view.v1", revision: 9 };
+          },
+        },
+      }),
+    }),
+  });
+  const payload = await (await routes.tree(new Request(
+    `http://host${SPINE_TREE_PATH}?sessionId=session-1&since=9&source=source-1`,
+  ))).json();
+  assert.deepEqual(options, {});
+  assert.equal(payload.source, "source-2");
+  assert.equal(payload.revision, 9);
 });

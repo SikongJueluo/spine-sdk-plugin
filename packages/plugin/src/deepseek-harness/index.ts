@@ -43,6 +43,7 @@ export * from "./messages.js";
 export * from "./publisher.js";
 export * from "./recovery.js";
 export * from "./requests.js";
+export * from "./shared-store.js";
 export * from "./view.js";
 
 export const DEEPSEEK_HARNESS_ADAPTER_ID = "spine-plugin/deepseek-harness/v1" as const;

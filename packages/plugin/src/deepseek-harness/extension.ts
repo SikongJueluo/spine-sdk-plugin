@@ -24,8 +24,10 @@ import {
 } from "./index.js";
 import {
   DeepSeekHarnessInspection,
-  SPINE_INSPECTION_SERVICE,
+  SPINE_INSPECTION_HOST_SERVICE,
   looksLikeLoopRequest,
+  type SpineInspectionContribution,
+  type SpineInspectionHost,
 } from "./inspection.js";
 import { materializeDeepSeekHarnessContext } from "./messages.js";
 import {
@@ -34,10 +36,16 @@ import {
   type DeepSeekHarnessRequestStore,
 } from "./requests.js";
 import {
+  DEEPSEEK_HARNESS_LEDGER_DOMAIN,
   openDeepSeekHarnessLedger,
   type DeepSeekHarnessLedger,
   type DeepSeekHarnessLedgerEntry,
 } from "./ledger.js";
+import {
+  leaseSharedRequestStore,
+  leaseSharedStore,
+  type DeepSeekHarnessStoreLease,
+} from "./shared-store.js";
 import {
   DeepSeekHarnessSamplingLifecycle,
   type DeepSeekHarnessLifecycleReporter,
@@ -57,12 +65,18 @@ export interface Config {
   enabled?: boolean;
   configToml?: string;
   spawnProvider?: string;
-  /** Serve the read-only Spine Tree inspection service (default true). */
+  /** Contribute a read-only inspection to the Host Spine Tree broker (default true). */
   inspect?: boolean;
   /** Capture frozen model requests as request evidence (default true). */
   requestAudit?: boolean;
   /** Captured requests retained per Session, oldest pruned first (default 100). */
   requestRetention?: number;
+  /**
+   * Agent preset id this row serves. The Host broker uses it to pick between
+   * several Spine-enabled presets for a historical Session. Optional: a live
+   * Session header supplies the same durable identity and outranks this seed.
+   */
+  presetId?: string;
 }
 
 interface DshAgent {
@@ -107,6 +121,9 @@ const MEMORY_OUTPUT_SCHEMA = {
   },
 } as const;
 
+/** Diagnostics identity for each mounted revision's broker contribution. */
+let inspectionInstances = 0;
+
 export function apply(ctx: Context, config: Config = {}): void {
   if (config.enabled === false) return;
   assertExclusiveCompaction(ctx, "load");
@@ -116,19 +133,25 @@ export function apply(ctx: Context, config: Config = {}): void {
   const resolvedStates = new WeakMap<Session, SessionState>();
   const bySessionId = new Map<string, Promise<SessionState>>();
   const liveStates = new Set<Promise<SessionState>>();
-  let ledgerPromise: Promise<DeepSeekHarnessLedger> | undefined;
-  let requestStorePromise: Promise<DeepSeekHarnessRequestStore> | undefined;
+  let ledgerLease: DeepSeekHarnessStoreLease<DeepSeekHarnessLedger> | undefined;
+  let requestLease: DeepSeekHarnessStoreLease<DeepSeekHarnessRequestStore> | undefined;
 
   const ledger = (): Promise<DeepSeekHarnessLedger> => {
-    ledgerPromise ??= openDeepSeekHarnessLedger(ctx.storageDomain);
-    return ledgerPromise;
+    ledgerLease ??= leaseSharedStore(
+      ctx.storageDomain,
+      DEEPSEEK_HARNESS_LEDGER_DOMAIN,
+      () => openDeepSeekHarnessLedger(ctx.storageDomain),
+    );
+    return ledgerLease.store;
   };
 
   const requestStore = (): Promise<DeepSeekHarnessRequestStore> => {
-    requestStorePromise ??= openDeepSeekHarnessRequestStore(ctx.storageDomain, {
-      retention: config.requestRetention ?? DEFAULT_REQUEST_RETENTION,
-    });
-    return requestStorePromise;
+    requestLease ??= leaseSharedRequestStore(
+      ctx.storageDomain,
+      (retention) => openDeepSeekHarnessRequestStore(ctx.storageDomain, { retention }),
+      config.requestRetention ?? DEFAULT_REQUEST_RETENTION,
+    );
+    return requestLease.store;
   };
 
   const inspection = config.inspect === false
@@ -136,6 +159,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     : new DeepSeekHarnessInspection({
         ledger,
         requests: config.requestAudit === false ? undefined : requestStore,
+        presetId: config.presetId,
         inspectSession: async (sessionId) => {
           const controller = (ctx as unknown as {
             get(name: string): unknown;
@@ -157,15 +181,29 @@ export function apply(ctx: Context, config: Config = {}): void {
       });
   if (inspection !== null) {
     inspection.start();
-    ctx.effect(() => {
-      const release = (ctx as unknown as {
-        provide(name: string, value: unknown): () => void;
-      }).provide(SPINE_INSPECTION_SERVICE, inspection);
-      return () => {
-        release();
-        void inspection.close();
-      };
-    }, "spine: read-only inspection service");
+    // A preset plugin may not publish a service into the root realm: DSH
+    // rejects that mount as a preset service leak. Contribute to the Host Web
+    // companion's broker instead. The nested injection is optional by
+    // construction, so a CLI/TUI composition without the Web companion never
+    // waits for this service.
+    const contribution: SpineInspectionContribution = {
+      id: `spine-inspection-${++inspectionInstances}`,
+      presetId: () => inspection.presetId(),
+      hasLive: (sessionId) => inspection.hasLive(sessionId),
+      owns: (sessionId) => inspection.owns(sessionId),
+      view: (sessionId, request) => inspection.view(sessionId, request),
+      request: (sessionId, requestId) => inspection.request(sessionId, requestId),
+    };
+    ctx.inject([SPINE_INSPECTION_HOST_SERVICE], (brokerCtx) => {
+      const broker = (brokerCtx as unknown as {
+        get(name: string): unknown;
+      }).get(SPINE_INSPECTION_HOST_SERVICE) as SpineInspectionHost | undefined;
+      if (broker === undefined) return;
+      brokerCtx.effect(
+        () => broker.register(contribution),
+        "spine: Host inspection contribution",
+      );
+    });
   }
 
   const ensureState = (agent: DshAgent): Promise<SessionState> => {
@@ -271,12 +309,13 @@ export function apply(ctx: Context, config: Config = {}): void {
       result.value.lifecycle.dispose();
       result.value.runtime.dispose();
     }
-    if (ledgerPromise !== undefined) {
-      await ledgerPromise.then((open) => open.close()).catch(() => undefined);
-    }
-    if (requestStorePromise !== undefined) {
-      await requestStorePromise.then((open) => open.close()).catch(() => undefined);
-    }
+    await inspection?.close().catch(() => undefined);
+    // Close only this instance's leases: another mounted preset revision may
+    // still hold the same shared domain open.
+    await Promise.allSettled([
+      ledgerLease?.release(),
+      requestLease?.release(),
+    ]);
   }, "spine: dispose DSH session runtimes");
 
   for (const toolName of SPINE_TOOL_NAMES) {
