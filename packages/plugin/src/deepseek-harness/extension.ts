@@ -548,7 +548,17 @@ async function* beginThenStream(
   inspection: DeepSeekHarnessInspection | null,
 ): AsyncIterable<StreamChunk> {
   const resolved = await state;
-  if (inspection !== null && looksLikeLoopRequest(request, String(resolved.session.id))) {
+  if (!looksLikeLoopRequest(request, String(resolved.session.id))) {
+    // `llm/stream` surrounds every model call, not only the loop's step
+    // requests. A hand-built one-shot call — the auto-permit approval judge, a
+    // search planner — borrows the Session id for routing but is not a step: it
+    // reaches its provider untouched, without beginning, settling, auditing, or
+    // faulting the main sampling transaction. The same classification gates
+    // request capture, so evidence and sampling admission cannot disagree.
+    yield* next();
+    return;
+  }
+  if (inspection !== null) {
     // Capturing evidence is an observation: it must run before sampling starts,
     // it must never block the model call, and a failure is reported, not thrown.
     inspection.captureRequest(resolved.session, request, (plan, projection) =>

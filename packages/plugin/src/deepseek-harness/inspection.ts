@@ -73,6 +73,11 @@ export interface SpineInspectionHost {
  * A loop-built request is instead recognizable by its own contract: it carries
  * the loop's Session identity, has no auxiliary `purpose`, and passes the
  * system prompt as the leading system-role message instead of `system`.
+ *
+ * The result decides both request capture and sampling admission: only a loop
+ * request owns the Session's main sampling transaction. A same-session request
+ * that declares a purpose or a top-level `system` is a hand-built one-shot call
+ * and must not begin, settle, or fault that transaction.
  */
 export function looksLikeLoopRequest(request: unknown, sessionId: string): boolean {
   if (request === null || typeof request !== "object") return false;

@@ -79,6 +79,26 @@ prepared operation. A crash can therefore leave source events without an
 archive (replayed as sources, with a fresh sampling attempt) but never an
 archive whose cited sources are missing.
 
+## Sampling ownership
+
+`llm/stream` wraps every streaming model call, not only the agent loop's step
+requests; `agent/pre-step`, `agent/request-error`, and `agent/turn-stopping` are
+the agent-loop boundaries. A request joins the Session's main sampling
+transaction only when it is the loop's own: same Session id, no auxiliary
+`purpose`, no top-level `system`, and the rendered prompt as the leading
+system-role message. Hand-built one-shot calls that borrow the Session id for
+routing — the auto-permit approval judge, a search planner — are forwarded to
+their provider untouched: they begin, settle, audit, or fault nothing, so a
+failed judge cannot latch a lifecycle fault. The leading-system clause assumes
+the loop renders the effective prompt as its first message; a Spine-enabled
+preset always contributes a non-empty prompt, so its requests satisfy it, while
+a prompt-less request is not admitted to main sampling. The
+`markAgentLoopRequest` identity is not usable as a cross-package proof: it is a
+`WeakSet` private to one `@deepseek-ai/dsh-llm` module instance, and a
+separately loaded plugin resolves its own copy, which never contains the Host
+loop's marked request. A same-session request that does satisfy the loop
+contract while a sampling is active is a real re-entry and still faults.
+
 ## Context publication
 
 At `agent/pre-step` the adapter waits for the waterfall decision, admits the
