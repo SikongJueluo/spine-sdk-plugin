@@ -619,6 +619,44 @@ test("evidence never exceeds its declared storage bound", () => {
   assert.ok(Math.abs(hugePlan.bytes - planSize) < 32);
 });
 
+test("disabled request audit skips capture and preserves live tree updates", async () => {
+  const session = { id: "tree-only", header: { createdAt: 5 }, seq: 3, snapshotEvents: () => [] };
+  const inspection = new DeepSeekHarnessInspection({
+    ledger: async () => ({ findSession: async () => undefined, entries: async () => [] }),
+    inspectSession: async () => ({ events: [], createdAt: 5 }),
+    runtimeFactory: () => ({ client: {}, dispose() {} }),
+  });
+  const projection = {
+    nodes: [{ id: [0], parent: null, children: [], kind: "RootEpoch", status: "Opened", summary: "root", memory: null, start: 0, end: null }],
+    cursor: [0],
+    visible_context: [],
+    last_boundary: null,
+  };
+  inspection.start();
+  inspection.attach(session);
+  inspection.reportContext(session, { transactionId: null, contextPlan: planFor(1), projection }, "preview");
+  const before = await inspection.view(session.id);
+  let bodyReads = 0;
+  let materializations = 0;
+  const record = inspection.captureRequest(session, {
+    get messages() { bodyReads += 1; return []; },
+  }, () => { materializations += 1; return []; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(materializations, 0, "disabled audit must not materialize its comparison plan");
+  assert.equal(bodyReads, 0, "disabled audit must not inspect or copy the request body");
+  assert.equal(record, null);
+  const unchanged = await inspection.view(session.id, { since: before.revision });
+  assert.deepEqual(unchanged, { revision: before.revision, unchanged: true });
+  const closed = { ...projection, nodes: [{ ...projection.nodes[0], status: "Closed", end: 3 }] };
+  inspection.reportContext(session, { transactionId: "commit", contextPlan: planFor(1), projection: closed }, "commit");
+  const after = await inspection.view(session.id);
+  assert.equal(before.spine.nodes[0].status, "Opened");
+  assert.equal(after.spine.nodes[0].status, "Closed");
+  assert.equal(after.evidence.store, "unavailable");
+  assert.deepEqual(after.requests, []);
+  await inspection.close();
+});
+
 test("the inspection service serves revisions, evidence and details without touching Spine", async () => {
   const session = {
     id: "session-1",
@@ -741,7 +779,7 @@ test("the extension contributes its inspection to the Host broker over a cold Se
       });
     },
   };
-  apply(ctx, { presetId: "personal" });
+  apply(ctx, { presetId: "personal", requestAudit: true });
   assert.equal(provided, undefined);
   assert.equal(contributions.size, 1, "one contribution reaches the Host broker");
   const contribution = [...contributions][0];

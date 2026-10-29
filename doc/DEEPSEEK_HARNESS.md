@@ -255,7 +255,12 @@ a root-realm `provide`: a preset plugin that publishes a service makes DSH
 reject the whole preset with `agent-preset/invalid: Preset services require
 isolate realms`. The extension still works when the Web companion is absent;
 the optional nested injection simply never activates. It captures frozen loop
-requests when `requestAudit` is not `false`.
+requests only when `requestAudit: true` is explicitly configured. Request audit
+is off by default: no request snapshots or comparisons are made, and existing
+`spine_dsh_audit` data is not opened. The browser hides the request-audit tab
+and evidence footer while the Spine Tree, node statuses, cursor, and faults
+remain available (`inspect` still defaults to enabled). Disabling audit does
+not delete existing evidence or affect `spine_dsh_ledger` recovery.
 
 Tree responses carry a per-registration `source` generation beside the local
 numeric `revision`. The client sends both; the Host honors `since` only for the

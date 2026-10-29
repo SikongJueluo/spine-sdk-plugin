@@ -76,7 +76,7 @@ export interface Config {
   spawnProvider?: string;
   /** Contribute a read-only inspection to the Host Spine Tree broker (default true). */
   inspect?: boolean;
-  /** Capture frozen model requests as request evidence (default true). */
+  /** Opt in to frozen request capture and the request-audit UI (default false). */
   requestAudit?: boolean;
   /** Captured requests retained per Session, oldest pruned first (default 100). */
   requestRetention?: number;
@@ -168,7 +168,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     ? null
     : new DeepSeekHarnessInspection({
         ledger,
-        requests: config.requestAudit === false ? undefined : requestStore,
+        requests: config.requestAudit === true ? requestStore : undefined,
         presetId: config.presetId,
         inspectSession: async (sessionId) => {
           const controller = (ctx as unknown as {

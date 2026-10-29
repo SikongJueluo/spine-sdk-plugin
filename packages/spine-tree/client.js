@@ -116,7 +116,7 @@ window.__ModuleLoader__.load({
       "tree.emptyHint": "Spine 节点会在第一次采样提交后出现。",
       "unavailable.title": "Spine 未启用",
       "unavailable.body": "当前会话所属的 preset 没有提供 Spine 检查数据，因此没有可读取的树或请求证据。查看器不会自行伪造数据。",
-      "unavailable.hint": "在 preset 中启用 packages/plugin 的 deepseek-harness 扩展（inspect 未关闭），并用该 preset 新建会话；本页随后会显示实时树与请求证据。",
+      "unavailable.hint": "在 preset 中启用 packages/plugin 的 deepseek-harness 扩展（inspect 未关闭），并用该 preset 新建会话；本页随后会显示实时树。请求证据只在显式开启审计时提供。",
       "error.title": "无法读取 Spine 数据",
       "error.network": "与宿主的数据通道中断，正在重试。",
       "detail.overview": "概览",
@@ -232,7 +232,7 @@ window.__ModuleLoader__.load({
       "tree.emptyHint": "Nodes appear after the first committed sampling.",
       "unavailable.title": "Spine is not enabled",
       "unavailable.body": "The preset this Session uses does not provide Spine inspection data, so there is no tree or request evidence to read. The viewer does not invent one.",
-      "unavailable.hint": "Enable the deepseek-harness extension from packages/plugin in the preset (with inspect not disabled), then open a Session of that preset; this page then shows the live tree and request evidence.",
+      "unavailable.hint": "Enable the deepseek-harness extension from packages/plugin in the preset (with inspect not disabled), then open a Session of that preset; this page then shows the live tree. Request evidence is provided only when auditing is explicitly enabled.",
       "error.title": "Could not read Spine data",
       "error.network": "The host data channel is down; retrying.",
       "detail.overview": "Overview",
@@ -511,7 +511,7 @@ window.__ModuleLoader__.load({
         : String(props.sessionId);
       const feed = useSpineFeed(sessionId);
       const ticker = useTicker(feed.data !== null);
-      const [mode, setMode] = useState("tree");
+      const [tabMode, setTabMode] = useState("tree");
       const [pane, setPane] = useState("list");
       const [pinned, setPinned] = useState(false);
       const [selectedNode, setSelectedNode] = useState(null);
@@ -522,6 +522,12 @@ window.__ModuleLoader__.load({
       const tree = view === null || view === undefined ? null : view.spine;
       const requests = view === null || view === undefined || !Array.isArray(view.requests) ? [] : view.requests;
       const revision = view === null || view === undefined ? 0 : view.revision;
+      const auditVisible = view !== null && view !== undefined
+        && view.evidence !== null && view.evidence !== undefined
+        && view.evidence.store !== "unavailable"
+        && view.sessionId === sessionId;
+      const mode = auditVisible ? tabMode : "tree";
+      const activePane = auditVisible || tabMode !== "requests" ? pane : "list";
 
       const cursorId = tree === null || tree === undefined ? null : tree.cursorId;
       useEffect(() => {
@@ -575,6 +581,7 @@ window.__ModuleLoader__.load({
       );
 
       const selectNode = useCallback((id) => {
+        setTabMode("tree");
         setSelectedNode(id);
         setPinned(id !== cursorId);
         setPane("detail");
@@ -624,7 +631,7 @@ window.__ModuleLoader__.load({
 
       return h(
         "div",
-        { className: "spt-root", "data-pane": pane },
+        { className: "spt-root", "data-pane": activePane },
         h("style", null, CSS),
         h(
           "div",
@@ -632,8 +639,10 @@ window.__ModuleLoader__.load({
           h(
             "div",
             { className: "spt-tabs", role: "tablist" },
-            tab(t("mode.tree"), mode === "tree", () => { setMode("tree"); setPane("list"); }),
-            tab(t("mode.requests"), mode === "requests", () => { setMode("requests"); setPane("list"); }),
+            tab(t("mode.tree"), mode === "tree", () => { setTabMode("tree"); setPane("list"); }),
+            auditVisible
+              ? tab(t("mode.requests"), mode === "requests", () => { setTabMode("requests"); setPane("list"); })
+              : null,
           ),
           mode === "tree"
             ? h(
@@ -878,7 +887,7 @@ window.__ModuleLoader__.load({
             spawn: view.ledger.spawnTerminals,
           }));
         }
-        if (view.evidence !== null && view.evidence !== undefined) {
+        if (auditVisible) {
           parts.push(view.evidence.store === "error"
             ? t("footer.evidenceError", { message: view.evidence.message ?? "" })
             : t("footer.evidence", { count: view.evidence.captured }));

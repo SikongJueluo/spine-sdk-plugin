@@ -14,9 +14,15 @@ execution cursor, and faults. Live Sessions follow committed and published
 state; historical Sessions are rebuilt from the Host log plus the plugin-owned
 ledger. Missing or corrupt data is reported, never guessed.
 
-**Request audit** — for every model request captured while the plugin runs, the
-frozen `llm/stream` `GenerateOptions` is compared with the Spine
-`ContextPlan` that was current for that request. The comparison reports
+**Request audit (opt-in)** — disabled by default. Set `requestAudit: true` on the
+preset's Spine extension to capture requests and show the Requests tab. When
+disabled, the tab and evidence footer are hidden, no request snapshots or
+comparisons are made, and the audit store is not opened. The tree browser
+remains enabled, including node creation/closure, status, cursor, and faults;
+`inspect: false` disables the whole inspection and is not needed to disable audit.
+
+For every captured request, the frozen `llm/stream` `GenerateOptions` is compared
+with the Spine `ContextPlan` that was current for that request. The comparison reports
 `consistent`, `known differences`, `unexplained differences`, or `insufficient
 evidence`, and lists each difference with the plan cell and request message it
 refers to.
@@ -27,9 +33,9 @@ adapter replay state after `llm/stream`. Nothing here claims to capture HTTP
 bodies, request headers, credentials, or what a provider received.
 
 **Evidence** — captured requests are stored in the plugin-owned
-`spine_dsh_audit` domain and survive a restart. They are observations made
-after the feature was enabled; a Session without captured evidence reports
-`insufficient evidence` rather than a reconstructed request.
+`spine_dsh_audit` domain and survive a restart. Disabling audit neither opens nor
+deletes old records; it does not affect the canonical `spine_dsh_ledger`. Evidence
+is observed after audit was enabled, never reconstructed from Session history.
 
 ## Surface
 
@@ -83,6 +89,9 @@ after the feature was enabled; a Session without captured evidence reports
 
 ## Notes and limits
 
+- Explicitly enabling audit opens the existing evidence domain in memory.
+  Retention is per Session (default 100 records, up to 2 MiB each), not a global
+  byte or age limit; use request capture for bounded diagnostics, not routine use.
 - The request audit cannot prove that a memory summary is semantically
   complete; it checks transmission, order, duplication, anchoring and pairing.
 - A retry is a separate captured request. One captured `llm/stream` call is not

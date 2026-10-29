@@ -90,11 +90,11 @@ async function harness(headers, options = {}) {
   return { ctx, loader, broker, opens, closes };
 }
 
-function row(presetId) {
+function row(presetId, config = {}) {
   return {
     id: "spine",
     name: EXTENSION,
-    config: { enabled: true, presetId },
+    config: { enabled: true, presetId, ...config },
   };
 }
 
@@ -107,8 +107,8 @@ test("a Spine preset mounts without a realm leak and serves its Session through 
   const personalScope = createScope(loader.ctx, {});
   const workScope = createScope(loader.ctx, {});
 
-  const personal = await mountPreset(personalScope.ctx, "personal", [row("personal")]);
-  const work = await mountPreset(workScope.ctx, "work", [row("work")]);
+  const personal = await mountPreset(personalScope.ctx, "personal", [row("personal", { requestAudit: true })]);
+  const work = await mountPreset(workScope.ctx, "work", [row("work", { requestAudit: true })]);
 
   for (const mount of [personal, work]) {
     const entries = [...mount.tree.entries()];
@@ -185,7 +185,7 @@ test("the Host companion and a preset compose into working read-only routes", as
   const headers = new Map([
     ["session-personal", { createdAt: 5, agentPreset: "personal" }],
   ]);
-  const { ctx, loader } = await harness(headers, { withBroker: false });
+  const { ctx, loader, opens } = await harness(headers, { withBroker: false });
   const routes = [];
   ctx.provide("connection", {
     fetch: {
@@ -222,7 +222,12 @@ test("the Host companion and a preset compose into working read-only routes", as
     new Request("http://host/api/spine.request?sessionId=session-personal&id=missing"),
   )).json();
   assert.equal(detail.ok, false);
-  assert.match(detail.reason, /No captured evidence/);
+  assert.match(detail.reason, /disabled/);
+  assert.equal(tree.evidence.store, "unavailable");
+  assert.deepEqual(tree.requests, []);
+  assert.equal(opens.includes("spine_dsh_audit"), false,
+    "default tree and request routes must never load existing request evidence");
+  assert.equal(opens.includes("spine_dsh_ledger"), true);
 
   await scope.dispose();
   await hostFiber.dispose();

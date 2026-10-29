@@ -338,6 +338,7 @@ export class DeepSeekHarnessInspection implements SpineInspectionService {
     request: unknown,
     materialize: (plan: ContextPlanRecipe, projection: SpineProjection) => readonly unknown[],
   ): CapturedRequestRecord | null {
+    if (this.#options.requests === undefined) return null;
     const live = this.#liveFor(session);
     if (live === null) return null;
     const pending = live.pending;

@@ -275,9 +275,24 @@ async function runApprovalScenario(config) {
   return { harness, session };
 }
 
+for (const [label, config] of [["default", {}], ["explicitly disabled", { requestAudit: false }]]) {
+  test(`request audit stays off (${label}) while main sampling still commits`, async () => {
+    const { harness } = await runApprovalScenario(config);
+    try {
+      assert.equal(harness.domains.has(AUDIT_DOMAIN), false,
+        "disabled audit must not open or read existing request evidence");
+      const archives = archiveTypes(harness.domains);
+      assert.equal(archives.get("sampling_started"), 2);
+      assert.equal(archives.get("sampling_commit"), 2);
+    } finally {
+      await harness.dispose();
+    }
+  });
+}
+
 for (const inspect of [false, true]) {
   test(`an approval auxiliary call bypasses main sampling (inspect ${inspect})`, async () => {
-    const { harness, session } = await runApprovalScenario({ inspect });
+    const { harness, session } = await runApprovalScenario({ inspect, requestAudit: true });
     try {
       const archives = archiveTypes(harness.domains);
       assert.equal(archives.get("sampling_started"), 2,
