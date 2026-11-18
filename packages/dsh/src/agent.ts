@@ -1,5 +1,5 @@
 import type { Agent } from "@deepseek-ai/dsh-agent";
-import { isAppendSurfaceEvent, pluginRecordOf, type SessionEvent, type SessionSeq } from "@deepseek-ai/dsh-session";
+import { isAppendSurfaceEvent, isReplacementSurfaceEvent, pluginRecordOf, type SessionEvent, type SessionSeq } from "@deepseek-ai/dsh-session";
 import type { EpochOrdinalId, FeatureFlag, SpineProjection, Terminal } from "@spinejit/spine-sdk";
 import {
   createHostAdapter,
@@ -89,6 +89,7 @@ export class SpineAgent {
   #adapter!: SpineHostAdapter;
   /** Every session event seen, by seq. */
   readonly #events = new Map<number, SessionEvent>();
+  readonly #restoredSeqs = new Map<SessionSeq, SessionSeq>();
   /** Logged sources the core has not observed yet, in log order. */
   #unobserved: SessionEvent[] = [];
   readonly #sourceSeqs = new Map<string, SessionSeq>();
@@ -136,7 +137,13 @@ export class SpineAgent {
         context: {
           materialize: async (context) => planItems(context, (id) => spine.#seqOf(id)),
           publishAtomic: async (context) => {
-            spine.#plan = [...context.messages];
+            let plan = [...context.messages];
+            if (!spine.#recovering) {
+              spine.#restorePlannedGuardSources(plan);
+              plan = planItems(context, (id) => spine.#seqOf(id));
+              surfaceEdits(spine.#surface(), plan);
+            }
+            spine.#plan = plan;
             spine.#project(context.projection);
           },
         },
@@ -160,6 +167,7 @@ export class SpineAgent {
   accept(event: SessionEvent): void {
     if (this.#events.has(event.seq)) return;
     this.#events.set(event.seq, event);
+    this.#acceptRestoredGuardSource(event);
     if (isAppendSurfaceEvent(event) && surfaceRole(event) === "source") this.#unobserved.push(event);
     if (isUserSource(event)) {
       const number = this.#userNumbers.size + 1;
@@ -188,10 +196,14 @@ export class SpineAgent {
     this.#turn = turn;
     this.#step = step;
     await this.#guard(async () => {
+      do {
+        await this.#prepare();
+      } while (this.#unobserved.length > 0);
       if (this.#plan === null) return;
       applySurfaceEdits(this.agent.session, surfaceEdits(this.#surface(), this.#plan), turn, step);
       dropReasoning(this.agent.session, this.#plan.flatMap((item) =>
         item.type === "source" && item.withoutReasoning ? [item.seq] : []));
+      this.#assertSurfaceShowsPlan();
     });
   }
 
@@ -275,6 +287,7 @@ export class SpineAgent {
     }
     await this.settle();
     this.#recovering = false;
+    this.#plan = null;
   }
 
   #project(projection: SpineProjection): void {
@@ -291,6 +304,58 @@ export class SpineAgent {
     const source = await this.#adapter.continueNamespace(this.agent.id);
     for (const cell of source.cells) this.#sourceSeqs.set(sourceKey(cell.source_id), cell.boundary as SessionSeq);
     await this.#adapter.previewAndPublish();
+  }
+
+  #acceptRestoredGuardSource(event: SessionEvent): void {
+    if (!isReplacementSurfaceEvent(event) || event.type !== "user/message") return;
+    if (String(event.data.source.kind) !== "execution-guard" || event.sourceEventSeqs?.length !== 2) return;
+    const [slotSeq, sourceSeq] = event.sourceEventSeqs;
+    const slot = this.#event(slotSeq!);
+    const source = this.#event(sourceSeq!);
+    if (!isReplacementSurfaceEvent(slot) || surfaceRole(slot) !== "spine" || spineText(eventMessage(slot)) !== null) return;
+    if (!slot.sourceEventSeqs?.includes(source.seq) || source.type !== "user/message") return;
+    if (event.surfaceOp.startSeq !== slot.seq || event.surfaceOp.endSeq !== slot.seq || JSON.stringify(source.data) !== JSON.stringify(event.data)) return;
+    this.#restoredSeqs.set(source.seq, event.seq);
+  }
+
+  #restorePlannedGuardSources(plan: readonly PlanItem[]): void {
+    const surface = this.#surface();
+    const present = new Set(surface.map((node) => node.seq));
+    const missing = plan.filter((item): item is Extract<PlanItem, { type: "source" }> =>
+      item.type === "source" && !present.has(item.seq));
+    if (missing.length === 0) return;
+
+    const restorations = missing.flatMap((item) => {
+      const source = this.#event(item.seq);
+      if (source.type !== "user/message" || String(source.data.source.kind) !== "execution-guard") return [];
+      const replacement = [...this.#events.values()].find((event) =>
+        isReplacementSurfaceEvent(event) &&
+        event.sourceEventSeqs?.includes(source.seq) === true &&
+        present.has(event.seq) &&
+        surfaceRole(event) === "spine" &&
+        spineText(eventMessage(event)) === null);
+      if (replacement === undefined) return [];
+      return [{ item, source, replacement }];
+    });
+    if (restorations.length !== missing.length) return;
+    if (new Set(restorations.map(({ replacement }) => replacement.seq)).size !== restorations.length) {
+      throw new SpineDshError("multiple planned sources share one empty Spine replacement");
+    }
+
+    const virtualSources = new Map(restorations.map(({ item, replacement }) => [replacement.seq, item.seq]));
+    const virtualSurface = surface.map((node) => {
+      const sourceSeq = virtualSources.get(node.seq);
+      return sourceSeq === undefined ? node : { seq: sourceSeq, role: "source" as const, text: null };
+    });
+    surfaceEdits(virtualSurface, plan);
+
+    for (const { source, replacement } of restorations) {
+      const restored = this.agent.session.append("user/message", source.data, {
+        surfaceOp: { op: "replace", startSeq: replacement.seq, endSeq: replacement.seq },
+        sourceEventSeqs: [replacement.seq, source.seq],
+      });
+      this.accept(restored);
+    }
   }
 
   /** Observe every logged source and make sure a plan is published for it. */
@@ -338,13 +403,14 @@ export class SpineAgent {
   /** Observe the unobserved sources logged before `to`. */
   async #observe(to: number): Promise<number> {
     const count = this.#unobserved.findIndex((event) => event.seq >= to);
-    const events = this.#unobserved.splice(0, count < 0 ? this.#unobserved.length : count);
+    const events = this.#unobserved.slice(0, count < 0 ? this.#unobserved.length : count);
     if (events.length === 0) return 0;
     const ids = await this.#adapter.observeSources(events.map((event) => sourceCharacter(event, this.#anchorInText.has(event.seq))));
     if (ids.length !== events.length) {
       throw new SpineDshError(`Spine admitted ${ids.length} sources for ${events.length} events`);
     }
     ids.forEach((id, index) => this.#sourceSeqs.set(sourceKey(id), events[index]!.seq));
+    this.#unobserved.splice(0, events.length);
     return events.length;
   }
 
@@ -360,8 +426,9 @@ export class SpineAgent {
   }
 
   #seqOf(id: EpochOrdinalId): SessionSeq {
-    const seq = this.#sourceSeqs.get(sourceKey(id));
+    let seq = this.#sourceSeqs.get(sourceKey(id));
     if (seq === undefined) throw new SpineDshError(`Spine plan names unknown source ${sourceKey(id)}`);
+    while (this.#restoredSeqs.has(seq)) seq = this.#restoredSeqs.get(seq)!;
     return seq;
   }
 

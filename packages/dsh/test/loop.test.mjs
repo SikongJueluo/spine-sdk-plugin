@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createUserMessage } from "@deepseek-ai/dsh-llm";
+import { createDeveloperMessage, createUserMessage } from "@deepseek-ai/dsh-llm";
 
 import { mountDsh } from "./harness.mjs";
 import { call, memory, numbered, shown, result, closed } from "./shown.mjs";
@@ -116,6 +116,78 @@ const probeTool = {
   output: { schema: { type: "object", properties: {} }, render: () => [{ type: "text", text: "probed" }] },
   execute: async () => ({}),
 };
+
+test("a notice appended between turns survives the next step's projection", async () => {
+  const run = await scenario(["first", "second"], async (dsh) => {
+    const agent = await dsh.run("start");
+    agent.session.append("user/message", createUserMessage({
+      content: [{ type: "text", text: "authorization notice" }],
+      source: { kind: "execution-guard" },
+    }), { surfaceOp: "append" });
+    await dsh.send(agent, "continue");
+    return agent;
+  });
+
+  assert.deepEqual(run.ends, ["completed", "completed"]);
+  assert.deepEqual(run.requests[1], [
+    "user: [U1]\nstart", "context: …", "assistant: first", "user: authorization notice", "user: continue",
+  ]);
+  assert.ok(!run.events.some((event) => event.type === "developer/message" && event.data.message.source.kind === "spine" && event.data.message.content.length === 0 && event.sourceEventSeqs?.some((seq) => seq > 0)));
+});
+
+test("resume restores a planned execution-guard source shadowed by an old empty projection", async () => {
+  const first = await mountDsh(["first"]);
+  let id;
+  try {
+    const agent = await first.run("start");
+    id = agent.id;
+    first.ctx.on("agent/request", (payload) => {
+      if (payload.agent.id !== id) return;
+      const source = payload.agent.session.append("user/message", createUserMessage({
+        content: [{ type: "text", text: "authorization notice" }],
+        source: { kind: "execution-guard" },
+      }), { surfaceOp: "append" });
+      payload.agent.session.append("developer/message", {
+        turn: payload.turn,
+        step: payload.step,
+        message: createDeveloperMessage({ content: [], source: { kind: "spine" } }),
+      }, {
+        surfaceOp: { op: "replace", startSeq: source.seq, endSeq: source.seq },
+        sourceEventSeqs: [source.seq],
+      });
+      throw new Error("simulated prior Spine projection");
+    }, { prepend: true });
+    await first.send(agent, "interrupted turn");
+    await first.ctx.sessions.flush(agent.session);
+  } finally {
+    await first.dispose();
+  }
+
+  const resumed = await mountDsh(["continued"], { root: first.root });
+  try {
+    const agent = await resumed.resume(id);
+    await resumed.send(agent, "continue");
+    assert.deepEqual(resumed.adapter.requests.map(shown), [[
+      "user: [U1]\nstart", "context: …", "assistant: first", "user: authorization notice", "user: continue",
+    ]]);
+    assert.deepEqual(agent.session.snapshotEvents().filter((event) => event.type === "turn/end").map((event) => event.data.reason.kind), ["completed", "error", "completed"]);
+    assert.deepEqual(await resumed.restored(agent), agent.session.deriveMessages());
+    await resumed.ctx.sessions.flush(agent.session);
+  } finally {
+    await resumed.dispose();
+  }
+  const again = await mountDsh(["still works"], { root: first.root });
+  try {
+    const agent = await again.resume(id);
+    await again.send(agent, "again");
+    assert.deepEqual(again.adapter.requests.map(shown), [[
+      "user: [U1]\nstart", "context: …", "assistant: first", "user: authorization notice", "user: [U2]\ncontinue", "assistant: continued", "user: again",
+    ]]);
+    assert.deepEqual(await again.restored(agent), agent.session.deriveMessages());
+  } finally {
+    await again.dispose();
+  }
+});
 
 test("runtime context DSH adds inside a node stays in place when the node closes", async () => {
   const run = await scenario((dsh) => [
